@@ -28,12 +28,10 @@ on conflict (user_id) do update set
   username = excluded.username,
   user_email = excluded.user_email;
 
--- Option B: Post-signin workflow (after users sign in, link them by email)
--- After a user signs in with Google/Microsoft/email, run:
--- update public.users set tenant_id = '00000000-0000-0000-0000-000000000001'::uuid, username = 'eric.munsing'
--- where user_email = 'eric.munsing@gmail.com' and user_id = (select id from auth.users where email = 'eric.munsing@gmail.com');
-
--- Helper queries for admin:
--- Find auth.uid() for an email: select id, email from auth.users where email = 'eric.munsing@gmail.com';
--- Find tenant for an email: select public.tenant_id_from_email('eric.munsing@gmail.com');
--- List all users in a tenant: select user_email, username from public.users where tenant_id = '00000000-0000-0000-0000-000000000001'::uuid;
+-- Tenant-user map
+INSERT INTO "public"."user_tenant_map" ("user_id", "tenant_id")
+VALUES
+('<REPLACE_WITH_AUTH_UID_FOR_USER1>', '00000000-0000-0000-0000-000000000001'),
+('<REPLACE_WITH_AUTH_UID_FOR_USER2>', '00000000-0000-0000-0000-000000000001'),
+('<REPLACE_WITH_AUTH_UID_FOR_USER3>', '00000000-0000-0000-0000-000000000002'),
+('<REPLACE_WITH_AUTH_UID_FOR_USER4>', '00000000-0000-0000-0000-000000000002');

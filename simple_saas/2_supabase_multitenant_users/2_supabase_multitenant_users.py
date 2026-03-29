@@ -7,7 +7,7 @@ Multi-tenant ReBAC MVP: Supabase + FastAPI + Panel.
 - Data: tenants, users; RLS enforces access.
 - Panel: Login link when anonymous; when authenticated, email and org user list.
 
-Run: uvicorn webscenarios.12_supabase_full_demo:app --reload --port 8000
+Run: uvicorn 2_supabase_multitenant_users:app --reload --port 8000
 Set SUPABASE_URL, SUPABASE_ANON_KEY in .env. Optional: AUTH_REDIRECT_URL, SESSION_SECRET_KEY.
 SESSION_SECRET_KEY: use a stable secret so sessions persist across restarts (e.g. openssl rand -hex 32).
 Configure Google OAuth in Supabase Dashboard and add redirect URL: http://127.0.0.1:8000/auth/callback
