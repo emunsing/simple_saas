@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "simple_saas"
+version = "0.1.0"
+description = ""
+authors = ["emunsing <eric.munsing@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pandas = "*"
+openpyxl = "*"
+attrs = "*"
+cattrs = "*"
+fastapi = "*"
+uvicorn = "*"
+fastapi-users = {extras = ["sqlalchemy"], version = "*"}
+sqlalchemy = "*"
+asyncpg = "*"
+alembic = "*"
+panel = {extras = ["fastapi"], version = "*"}
+python-jose = {extras = ["cryptography"], version = "*"}
+passlib = {extras = ["bcrypt"], version = "*"}
+python-multipart = "*"
+pydantic = {extras = ["email"], version = "*"}
+python-dotenv = "*"
+httpx = "*"
+supabase = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
