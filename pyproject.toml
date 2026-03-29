@@ -11,13 +11,16 @@ pandas = "*"
 openpyxl = "*"
 attrs = "*"
 cattrs = "*"
-fastapi = "*"
+starlette = "0.52.1"
+fastapi = "0.129.0"
+bokeh-fastapi= "0.1.5"
+bokeh = "3.8.2"
+panel = {extras = ["fastapi"], version = "1.8.7"}
 uvicorn = "*"
 fastapi-users = {extras = ["sqlalchemy"], version = "*"}
 sqlalchemy = "*"
 asyncpg = "*"
 alembic = "*"
-panel = {extras = ["fastapi"], version = "*"}
 python-jose = {extras = ["cryptography"], version = "*"}
 passlib = {extras = ["bcrypt"], version = "*"}
 python-multipart = "*"

@@ -1,6 +1,8 @@
 # Apple
 .idea/
 
+*_exclude.sql
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
