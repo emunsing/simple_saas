@@ -15,6 +15,7 @@ CREATE INDEX idx_users_user_email ON public.users(user_email);
 -- Lookup table: NO RLS, and explicitly disable it even if
 -- Supabase auto-enables it
 CREATE SCHEMA IF NOT EXISTS private;
+GRANT USAGE ON SCHEMA private TO supabase_auth_admin;
 CREATE TABLE private.user_tenant_map (
   user_id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   tenant_id uuid NOT NULL REFERENCES public.tenants(id) ON DELETE RESTRICT
@@ -22,25 +23,29 @@ CREATE TABLE private.user_tenant_map (
 -- Force RLS OFF on this table
 ALTER TABLE private.user_tenant_map DISABLE ROW LEVEL SECURITY;
 
-CREATE TABLE public.products (
-  product_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id uuid NOT NULL REFERENCES public.tenants(id) ON DELETE RESTRICT,
-  created_by uuid NOT NULL REFERENCES public.users(user_id) ON DELETE RESTRICT
+create table private.tenant_email_allowlist (
+  email       text primary key,
+  tenant_id   uuid not null references tenants(id),
+  created_at  timestamptz default now()
 );
+ALTER TABLE private.tenant_email_allowlist DISABLE ROW LEVEL SECURITY;
+grant select on table private.tenant_email_allowlist to supabase_auth_admin;
 
-CREATE TABLE public.product_user_map (
-  product_id uuid NOT NULL REFERENCES public.products(product_id) ON DELETE CASCADE,
-  user_id uuid NOT NULL REFERENCES public.users(user_id) ON DELETE CASCADE,
-  PRIMARY KEY (product_id, user_id)
+create table if not exists private.auth_debug_log (
+  id serial primary key,
+  func_name text,
+  payload jsonb,
+  created_at timestamptz default now()
 );
+alter table private.auth_debug_log disable row level security;
+grant insert on private.auth_debug_log to supabase_auth_admin;
+grant usage on sequence private.auth_debug_log_id_seq to supabase_auth_admin;
 
 -- ============================================================
 -- ENABLE RLS (except user_tenant_map)
 -- ============================================================
 ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.product_user_map ENABLE ROW LEVEL SECURITY;
 
 -- ============================================================
 -- HELPER FUNCTIONS
@@ -72,6 +77,74 @@ AS $$
     WHERE user_id = check_user_id AND tenant_id = check_tenant_id
   );
 $$;
+
+create or replace function public.hook_check_allowlist(event jsonb)
+returns jsonb
+language plpgsql
+as $$
+declare
+  user_email text;
+  allowed boolean;
+begin
+  -- The before-user-created hook nests everything under "user"
+  user_email := event->'user'->>'email';
+
+  -- Fallback to user_metadata if needed
+  if user_email is null then
+    user_email := event->'user'->'user_metadata'->>'email';
+  end if;
+
+  select exists(
+    select 1 from private.tenant_email_allowlist
+    where email = lower(user_email)
+  ) into allowed;
+
+  if not allowed then
+    return jsonb_build_object(
+      'error', jsonb_build_object(
+        'http_code', 403,
+        'message', 'No account is associated with this email. Please contact your administrator.'
+      )
+    );
+  end if;
+
+  return event;
+end;
+$$;
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+as $$
+declare
+  matched_tenant_id uuid;
+begin
+  -- Look up the tenant for this email
+  select tenant_id into matched_tenant_id
+  from private.tenant_email_allowlist
+  where email = lower(new.email);
+
+  if matched_tenant_id is not null then
+    -- Insert into your users/profiles table
+    insert into public.users (user_id, user_email, username, tenant_id)
+    values (new.id, new.email, '', matched_tenant_id);
+
+    -- Clean up the allowlist entry
+    delete from private.tenant_email_allowlist
+    where email = lower(new.email);
+  end if;
+
+  return new;
+end;
+$$;
+
+grant execute on function public.hook_check_allowlist to supabase_auth_admin;
+revoke execute on function public.hook_check_allowlist from authenticated, anon, public;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
 
 -- Keep user_tenant_map in sync via trigger
 CREATE OR REPLACE FUNCTION public.sync_user_tenant_map()
@@ -109,66 +182,3 @@ CREATE POLICY "tenants_select_own"
   ON public.tenants FOR SELECT
   TO authenticated
   USING (id = (select public.current_user_tenant_id()));
-
--- Products: see if same tenant or in product_user_map
-CREATE POLICY "products_select"
-  ON public.products FOR SELECT
-  TO authenticated
-  USING (
-    tenant_id = (select public.current_user_tenant_id())
-    OR product_id IN (
-      SELECT product_id FROM public.product_user_map
-      WHERE user_id = (select auth.uid())
-    )
-  );
-
--- Products: insert in own tenant
-CREATE POLICY "products_insert"
-  ON public.products FOR INSERT
-  TO authenticated
-  WITH CHECK (
-    (select public.current_user_tenant_id()) IS NOT NULL
-    AND tenant_id = (select public.current_user_tenant_id())
-    AND created_by = (select auth.uid())
-  );
-
--- product_user_map: see if you're the user or product owner
-CREATE POLICY "product_user_map_select"
-  ON public.product_user_map FOR SELECT
-  TO authenticated
-  USING (
-    user_id = (select auth.uid())
-    OR product_id IN (
-      SELECT product_id FROM public.products
-      WHERE created_by = (select auth.uid())
-    )
-  );
-
--- product_user_map: insert only if you created the product
-CREATE POLICY "product_user_map_insert"
-  ON public.product_user_map FOR INSERT
-  TO authenticated
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM public.products p
-      WHERE p.product_id = product_user_map.product_id
-        AND p.created_by = (select auth.uid())
-        AND p.tenant_id = (select public.current_user_tenant_id())
-    )
-    AND public.user_belongs_to_tenant(
-      product_user_map.user_id,
-      (SELECT tenant_id FROM public.products
-       WHERE product_id = product_user_map.product_id)
-    )
-  );
-
--- product_user_map: delete only if you created the product
-CREATE POLICY "product_user_map_delete"
-  ON public.product_user_map FOR DELETE
-  TO authenticated
-  USING (
-    product_id IN (
-      SELECT product_id FROM public.products
-      WHERE created_by = (select auth.uid())
-    )
-  );

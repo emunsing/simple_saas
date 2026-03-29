@@ -29,7 +29,7 @@ on conflict (user_id) do update set
   user_email = excluded.user_email;
 
 -- Tenant-user map
-INSERT INTO "public"."user_tenant_map" ("user_id", "tenant_id")
+INSERT INTO "private"."user_tenant_map" ("user_id", "tenant_id")
 VALUES
 ('<REPLACE_WITH_AUTH_UID_FOR_USER1>', '00000000-0000-0000-0000-000000000001'),
 ('<REPLACE_WITH_AUTH_UID_FOR_USER2>', '00000000-0000-0000-0000-000000000001'),

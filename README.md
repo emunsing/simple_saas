@@ -23,8 +23,26 @@ The uvicorn+panel demos can be run like `python <scriptname>.py` or `uvicorn <sc
 
 The demos go in the following order:
 - `0_supabase_simple_oauth.py`: Basic PKCE OAuth with Supabase client
-- `1_supabase_full_demo`: Full multi-tenant database access, relying on Supabase data
-- `2_supabase_postgres_demo`: Use Supabase for auth, but a separate Postgres database not hosted on Supabase.
+- `1_supabase_panel_simple_oauth.py`: Similar to the above, but using Panel instead of raw HTML to ensure that your Panel + Uvicorn setup is working.
+- `2_supabase_multitenant_users`: Given pre-populated entries in the database, demonstrate we can do multi-tenant user authentication.
+- `3_supabase_multitenant_admin`: Add admin roles and views for user administration.  
+
+# Specific requirements
+
+## 2_supabase_multitenant_users
+
+Run the migration1.sql script, and populate sample data using the migration_sampledata.sql script. This updates:
+- public.tenants with two tenants
+- public.users : This relies on pulling the user id from the supabase auth.auth table or from the logs.
+- private.user_tenant_map : Needed as a private table to identify the tenant for subsequent RLS queries.
+
+## 3_supabase_multitenant_admin
+
+The migration data for this is smaller, but we are dependent on Supabase auth hooks for being able to check whether the 
+user is present in the tenant_email_allowlist and triggering the update of the `user` and `user_tenant_map` tables.  
+
+**Setup:** Run the migrations, and then in the Supabase.com dashboard, go to Authentication ->  Auth Hooks and click
+"Add Hook" - in the dropdown, select "Before User Created hook". Choose the "hook_check_allowlist" function.
 
 # Auth lessons
 
