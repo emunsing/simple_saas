@@ -43,6 +43,16 @@ Supabase authentication creates a JWT which contains the user's
 
 ## Panel + Uvicorn Gotchas
 
+### Versioning
+
+Starlette 1.0 created significant issues for the compatability with Bokeh/Panel.  Currently, 
+we pin `[starlette, fastapi, bokeh-fastapi, bokeh, panel]` to ensure that we are compatible. 
+If you get a persistent 403 error and are sure that your app isn't getting any other backend issues, it's likely a 
+versioning issue.  
+
+**To test that your Panel + Starlette is working,** run the 1_supabase_panel_simple_oauth.py - this doesn't rely on 
+a database, so if you aren't able to render any Panel page for this app, you probably have a version issue.
+
 ### Cookie size
 Websocket has a limited cookie capacity.  If you have been using `localhost` for a lot of development, you may have
 accumulated many cookies, to the point that Bokeh/Websocket will refuse to parse the cookies when the HTTP request is
