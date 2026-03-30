@@ -41,7 +41,10 @@ Run the migration1.sql script, and populate sample data using the migration_samp
 The migration data for this is smaller, but we are dependent on Supabase auth hooks for being able to check whether the 
 user is present in the tenant_email_allowlist and triggering the update of the `user` and `user_tenant_map` tables.  
 
-**Setup:** Run the migrations, and then in the Supabase.com dashboard, go to Authentication ->  Auth Hooks and click
+**Setup:** 
+1. **DELETE ALL USERS FROM SUPABASE** To trigger the "Before User Created" hook, we need to ensure that the user isn't
+in the auth.users table.  This is best accomplished from the "Authentication" page.
+2. Run the migrations, and then in the Supabase.com dashboard, go to Authentication ->  Auth Hooks and click
 "Add Hook" - in the dropdown, select "Before User Created hook". Choose the "hook_check_allowlist" function.
 
 # Auth lessons

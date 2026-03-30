@@ -1,57 +1,80 @@
+-- ============================================================
+-- TYPES
+-- ============================================================
+CREATE TYPE public.user_role AS ENUM (
+  'saasco_superuser',
+  'saasco_employee',
+  'tenant_superuser',
+  'tenant_admin',
+  'user'
+);
+
+-- ============================================================
+-- TABLES
+-- ============================================================
 CREATE TABLE public.tenants (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+  id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL DEFAULT ''
 );
 
 CREATE TABLE public.users (
-  user_id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  tenant_id uuid NOT NULL REFERENCES public.tenants(id) ON DELETE RESTRICT,
-  username text NOT NULL,
+  user_id    uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  tenant_id  uuid NOT NULL REFERENCES public.tenants(id) ON DELETE RESTRICT,
+  username   text NOT NULL,
   user_email text NOT NULL,
+  role       public.user_role NOT NULL DEFAULT 'user',
   UNIQUE(tenant_id, username),
   UNIQUE(user_email)
 );
 CREATE INDEX idx_users_user_email ON public.users(user_email);
 
--- Lookup table: NO RLS, and explicitly disable it even if
--- Supabase auto-enables it
+-- Pending signups: lives in public so RLS can gate REST API access.
+-- supabase_auth_admin reads it via SECURITY DEFINER hook functions.
+CREATE TABLE public.tenant_email_allowlist (
+  email      text PRIMARY KEY,
+  tenant_id  uuid NOT NULL REFERENCES public.tenants(id),
+  role       public.user_role NOT NULL DEFAULT 'user',
+  created_at timestamptz DEFAULT now()
+);
+
+-- ============================================================
+-- PRIVATE SCHEMA
+-- Only non-REST internal tables live here.
+-- ============================================================
 CREATE SCHEMA IF NOT EXISTS private;
 GRANT USAGE ON SCHEMA private TO supabase_auth_admin;
+
+-- Fast tenant lookup used by RLS helper (no RLS needed here)
 CREATE TABLE private.user_tenant_map (
-  user_id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  user_id   uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   tenant_id uuid NOT NULL REFERENCES public.tenants(id) ON DELETE RESTRICT
 );
--- Force RLS OFF on this table
 ALTER TABLE private.user_tenant_map DISABLE ROW LEVEL SECURITY;
 
-create table private.tenant_email_allowlist (
-  email       text primary key,
-  tenant_id   uuid not null references tenants(id),
-  created_at  timestamptz default now()
+CREATE TABLE IF NOT EXISTS private.auth_debug_log (
+  id         serial PRIMARY KEY,
+  func_name  text,
+  payload    jsonb,
+  created_at timestamptz DEFAULT now()
 );
-ALTER TABLE private.tenant_email_allowlist DISABLE ROW LEVEL SECURITY;
-grant select on table private.tenant_email_allowlist to supabase_auth_admin;
-
-create table if not exists private.auth_debug_log (
-  id serial primary key,
-  func_name text,
-  payload jsonb,
-  created_at timestamptz default now()
-);
-alter table private.auth_debug_log disable row level security;
-grant insert on private.auth_debug_log to supabase_auth_admin;
-grant usage on sequence private.auth_debug_log_id_seq to supabase_auth_admin;
+ALTER TABLE private.auth_debug_log DISABLE ROW LEVEL SECURITY;
+GRANT INSERT ON private.auth_debug_log TO supabase_auth_admin;
+GRANT USAGE ON SEQUENCE private.auth_debug_log_id_seq TO supabase_auth_admin;
 
 -- ============================================================
--- ENABLE RLS (except user_tenant_map)
+-- ENABLE RLS
 -- ============================================================
-ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenants               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.users                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_email_allowlist ENABLE ROW LEVEL SECURITY;
 
 -- ============================================================
--- HELPER FUNCTIONS
--- Reads from user_tenant_map (no RLS) to avoid recursion.
--- Wrapping auth.uid() in (select ...) for performance per Supabase docs.
+-- HELPER FUNCTIONS (SECURITY DEFINER, bypass RLS)
+-- Used inside RLS policy USING/WITH CHECK expressions.
+-- Wrap auth.uid() in (select ...) per Supabase performance docs.
 -- ============================================================
+
+-- Current user's tenant id (reads private map to avoid RLS recursion)
 CREATE OR REPLACE FUNCTION public.current_user_tenant_id()
 RETURNS uuid
 LANGUAGE sql
@@ -60,7 +83,30 @@ SET search_path = public
 STABLE
 AS $$
   SELECT tenant_id FROM private.user_tenant_map
-  WHERE user_id = (select auth.uid()) LIMIT 1;
+  WHERE user_id = (SELECT auth.uid()) LIMIT 1;
+$$;
+
+-- Current user's role
+CREATE OR REPLACE FUNCTION public.current_user_role()
+RETURNS public.user_role
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+  SELECT role FROM public.users
+  WHERE user_id = (SELECT auth.uid()) LIMIT 1;
+$$;
+
+-- Convenience predicate: is the current user SaasCo staff?
+CREATE OR REPLACE FUNCTION public.is_saasco_staff()
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+  SELECT (SELECT public.current_user_role()) IN ('saasco_superuser', 'saasco_employee');
 $$;
 
 CREATE OR REPLACE FUNCTION public.user_belongs_to_tenant(
@@ -78,75 +124,91 @@ AS $$
   );
 $$;
 
-create or replace function public.hook_check_allowlist(event jsonb)
-returns jsonb
-language plpgsql
-as $$
-declare
+-- ============================================================
+-- AUTH HOOK: block signups not on the allowlist
+-- SECURITY DEFINER so it bypasses RLS when called by supabase_auth_admin.
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.hook_check_allowlist(event jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
   user_email text;
-  allowed boolean;
-begin
-  -- The before-user-created hook nests everything under "user"
+  allowed    boolean;
+BEGIN
+--  insert into private.auth_debug_log (func_name, payload)
+--  values ('hook_check_allowlist', event);
   user_email := event->'user'->>'email';
-
-  -- Fallback to user_metadata if needed
-  if user_email is null then
+  IF user_email IS NULL THEN
     user_email := event->'user'->'user_metadata'->>'email';
-  end if;
+  END IF;
 
-  select exists(
-    select 1 from private.tenant_email_allowlist
-    where email = lower(user_email)
-  ) into allowed;
+--  insert into private.auth_debug_log (func_name, payload)
+--    values ('hook_check_allowlist_extracted', jsonb_build_object(
+--      'extracted_email', user_email,
+--      'raw_user_meta_data', event->'raw_user_meta_data',
+--      'top_level_email', event->>'email'
+--    ));
 
-  if not allowed then
-    return jsonb_build_object(
+  SELECT EXISTS(
+    SELECT 1 FROM public.tenant_email_allowlist
+    WHERE email = lower(user_email)
+  ) INTO allowed;
+
+  IF NOT allowed THEN
+    RETURN jsonb_build_object(
       'error', jsonb_build_object(
         'http_code', 403,
         'message', 'No account is associated with this email. Please contact your administrator.'
       )
     );
-  end if;
+  END IF;
 
-  return event;
-end;
+  RETURN event;
+END;
 $$;
 
-create or replace function public.handle_new_user()
-returns trigger
-language plpgsql
-security definer
-as $$
-declare
+GRANT EXECUTE ON FUNCTION public.hook_check_allowlist TO supabase_auth_admin;
+REVOKE EXECUTE ON FUNCTION public.hook_check_allowlist FROM authenticated, anon, public;
+
+-- ============================================================
+-- TRIGGER: populate public.users on first login
+-- SECURITY DEFINER bypasses RLS to read allowlist and write users.
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
   matched_tenant_id uuid;
-begin
-  -- Look up the tenant for this email
-  select tenant_id into matched_tenant_id
-  from private.tenant_email_allowlist
-  where email = lower(new.email);
+  matched_role      public.user_role;
+BEGIN
+  SELECT tenant_id, role
+    INTO matched_tenant_id, matched_role
+    FROM public.tenant_email_allowlist
+   WHERE email = lower(new.email);
 
-  if matched_tenant_id is not null then
-    -- Insert into your users/profiles table
-    insert into public.users (user_id, user_email, username, tenant_id)
-    values (new.id, new.email, '', matched_tenant_id);
+  IF matched_tenant_id IS NOT NULL THEN
+    INSERT INTO public.users (user_id, user_email, username, tenant_id, role)
+    VALUES (new.id, new.email, '', matched_tenant_id, COALESCE(matched_role, 'user'));
 
-    -- Clean up the allowlist entry
-    delete from private.tenant_email_allowlist
-    where email = lower(new.email);
-  end if;
+    DELETE FROM public.tenant_email_allowlist WHERE email = lower(new.email);
+  END IF;
 
-  return new;
-end;
+  RETURN new;
+END;
 $$;
 
-grant execute on function public.hook_check_allowlist to supabase_auth_admin;
-revoke execute on function public.hook_check_allowlist from authenticated, anon, public;
+CREATE OR REPLACE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute function public.handle_new_user();
-
--- Keep user_tenant_map in sync via trigger
+-- ============================================================
+-- TRIGGER: keep private.user_tenant_map in sync
+-- ============================================================
 CREATE OR REPLACE FUNCTION public.sync_user_tenant_map()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -167,18 +229,92 @@ CREATE TRIGGER sync_user_tenant_map_on_upsert
   EXECUTE FUNCTION public.sync_user_tenant_map();
 
 -- ============================================================
--- POLICIES
--- Wrap function calls in (select ...) for performance.
+-- RLS POLICIES
+-- Wrap helper calls in (select ...) for per-statement caching.
+-- Multiple SELECT policies combine with OR: a row is visible if
+-- ANY passing policy matches.
 -- ============================================================
 
--- Users: see same-tenant users
-CREATE POLICY "users_select_same_tenant"
-  ON public.users FOR SELECT
-  TO authenticated
-  USING (tenant_id = (select public.current_user_tenant_id()));
+-- ---- public.tenants ----
 
--- Tenants: see own tenant
 CREATE POLICY "tenants_select_own"
   ON public.tenants FOR SELECT
   TO authenticated
-  USING (id = (select public.current_user_tenant_id()));
+  USING (id = (SELECT public.current_user_tenant_id()));
+
+CREATE POLICY "tenants_select_saasco_staff"
+  ON public.tenants FOR SELECT
+  TO authenticated
+  USING ((SELECT public.is_saasco_staff()));
+
+-- Only SaasCo staff may create tenants
+CREATE POLICY "tenants_insert_saasco_staff"
+  ON public.tenants FOR INSERT
+  TO authenticated
+  WITH CHECK ((SELECT public.is_saasco_staff()));
+
+-- ---- public.users ----
+
+CREATE POLICY "users_select_same_tenant"
+  ON public.users FOR SELECT
+  TO authenticated
+  USING (tenant_id = (SELECT public.current_user_tenant_id()));
+
+CREATE POLICY "users_select_saasco_staff"
+  ON public.users FOR SELECT
+  TO authenticated
+  USING ((SELECT public.is_saasco_staff()));
+
+-- ---- public.tenant_email_allowlist ----
+
+-- SELECT: SaasCo staff see all; tenant admins/superusers see their own tenant
+CREATE POLICY "allowlist_select_saasco_staff"
+  ON public.tenant_email_allowlist FOR SELECT
+  TO authenticated
+  USING ((SELECT public.is_saasco_staff()));
+
+CREATE POLICY "allowlist_select_tenant_admin"
+  ON public.tenant_email_allowlist FOR SELECT
+  TO authenticated
+  USING (
+    tenant_id = (SELECT public.current_user_tenant_id())
+    AND (SELECT public.current_user_role()) IN ('tenant_superuser', 'tenant_admin')
+  );
+
+-- INSERT: role-on-role constraints expressed directly in WITH CHECK
+--   saasco_superuser  → any role, any tenant
+--   saasco_employee   → any role except saasco_superuser, any tenant
+--   tenant_superuser  → tenant_admin or user, own tenant only
+--   tenant_admin      → user only, own tenant only
+CREATE POLICY "allowlist_insert_admin"
+  ON public.tenant_email_allowlist FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    (SELECT public.current_user_role()) = 'saasco_superuser'
+    OR (
+      (SELECT public.current_user_role()) = 'saasco_employee'
+      AND role != 'saasco_superuser'
+    )
+    OR (
+      (SELECT public.current_user_role()) = 'tenant_superuser'
+      AND tenant_id = (SELECT public.current_user_tenant_id())
+      AND role IN ('tenant_admin', 'user')
+    )
+    OR (
+      (SELECT public.current_user_role()) = 'tenant_admin'
+      AND tenant_id = (SELECT public.current_user_tenant_id())
+      AND role = 'user'
+    )
+  );
+
+-- DELETE: SaasCo staff can remove any entry; tenant admins/superusers only their tenant
+CREATE POLICY "allowlist_delete_admin"
+  ON public.tenant_email_allowlist FOR DELETE
+  TO authenticated
+  USING (
+    (SELECT public.is_saasco_staff())
+    OR (
+      tenant_id = (SELECT public.current_user_tenant_id())
+      AND (SELECT public.current_user_role()) IN ('tenant_superuser', 'tenant_admin')
+    )
+  );
