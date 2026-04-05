@@ -33,8 +33,10 @@ CREATE INDEX idx_users_user_email ON public.users(user_email);
 CREATE TABLE public.tenant_email_allowlist (
   email      text PRIMARY KEY,
   tenant_id  uuid NOT NULL REFERENCES public.tenants(id),
+  username   text NOT NULL,
   role       public.user_role NOT NULL DEFAULT 'user',
-  created_at timestamptz DEFAULT now()
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(tenant_id, username)
 );
 
 -- ============================================================
@@ -185,15 +187,16 @@ AS $$
 DECLARE
   matched_tenant_id uuid;
   matched_role      public.user_role;
+  matched_username  text;
 BEGIN
-  SELECT tenant_id, role
-    INTO matched_tenant_id, matched_role
+  SELECT tenant_id, role, username
+    INTO matched_tenant_id, matched_role, matched_username
     FROM public.tenant_email_allowlist
    WHERE email = lower(new.email);
 
   IF matched_tenant_id IS NOT NULL THEN
     INSERT INTO public.users (user_id, user_email, username, tenant_id, role)
-    VALUES (new.id, new.email, '', matched_tenant_id, COALESCE(matched_role, 'user'));
+    VALUES (new.id, new.email, matched_username, matched_tenant_id, COALESCE(matched_role, 'user'));
 
     DELETE FROM public.tenant_email_allowlist WHERE email = lower(new.email);
   END IF;
@@ -223,10 +226,51 @@ BEGIN
 END;
 $$;
 
-CREATE TRIGGER sync_user_tenant_map_on_upsert
+CREATE OR REPLACE TRIGGER sync_user_tenant_map_on_upsert
   AFTER INSERT OR UPDATE ON public.users
   FOR EACH ROW
   EXECUTE FUNCTION public.sync_user_tenant_map();
+
+-- ============================================================
+-- USERNAME AVAILABILITY CHECK
+-- Returns true if (tenant_id, username) is free in both users and
+-- the allowlist.  Callers may only check their own tenant unless they
+-- are SaasCo staff; foreign-tenant queries always return false so no
+-- cross-tenant username enumeration is possible.
+-- p_exclude_email: skip this allowlist row (upsert / edit semantics).
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.check_username_available(
+  p_tenant_id     uuid,
+  p_username      text,
+  p_exclude_email text DEFAULT NULL
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+BEGIN
+  -- Enforce tenant scope: non-staff users may only query their own tenant.
+  IF NOT (SELECT public.is_saasco_staff())
+     AND p_tenant_id IS DISTINCT FROM (SELECT public.current_user_tenant_id())
+  THEN
+    RETURN false;
+  END IF;
+
+  RETURN NOT EXISTS (
+    SELECT 1 FROM public.users
+    WHERE tenant_id = p_tenant_id AND username = p_username
+    UNION ALL
+    SELECT 1 FROM public.tenant_email_allowlist
+    WHERE tenant_id = p_tenant_id
+      AND username = p_username
+      AND (p_exclude_email IS NULL OR email != lower(p_exclude_email))
+  );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.check_username_available TO authenticated;
 
 -- ============================================================
 -- RLS POLICIES

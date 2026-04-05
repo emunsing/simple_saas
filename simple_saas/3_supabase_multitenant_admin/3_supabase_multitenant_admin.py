@@ -19,7 +19,7 @@ Apply migration1.sql in Supabase before running.
 
 import logging
 import os
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from typing import Any, Optional
 
 import panel as pn
@@ -155,6 +155,7 @@ def _require_token() -> str:
 
 def list_org_users() -> list[dict[str, Any]]:
     """Users in the current user's tenant (RLS-scoped)."""
+    print("Called list_org_users")
     supabase = get_supabase_for_user(_require_token())
     r = supabase.table("users").select("user_id, username, user_email, tenant_id, role").execute()
     return list(r.data or [])
@@ -162,6 +163,7 @@ def list_org_users() -> list[dict[str, Any]]:
 
 def get_current_user_info() -> Optional[dict[str, Any]]:
     """Returns {user_id, role, tenant_id} for the current user, or None."""
+    print("Called get_current_user_info")
     token = _token()
     email = user_email_ctx.get()
     if not token or not email:
@@ -177,6 +179,7 @@ def get_current_user_info() -> Optional[dict[str, Any]]:
 
 def list_tenants() -> list[dict[str, Any]]:
     """All tenants visible to the current user (RLS-scoped)."""
+    print("Called list_tenants")
     supabase = get_supabase_for_user(_require_token())
     r = supabase.table("tenants").select("id, name").order("name").execute()
     return list(r.data or [])
@@ -184,16 +187,27 @@ def list_tenants() -> list[dict[str, Any]]:
 
 def admin_create_tenant(name: str) -> str:
     """Create a new tenant (RLS restricts to SaasCo staff). Returns new tenant id."""
+    print("Called admin_create_tenant with name:", name)
     supabase = get_supabase_for_user(_require_token())
     r = supabase.table("tenants").insert({"name": name}).execute()
     return r.data[0]["id"]
 
 
-def admin_add_to_allowlist(email: str, tenant_id: str, role: str) -> None:
-    """Upsert an allowlist entry. RLS enforces role-on-role constraints."""
+def admin_add_to_allowlist(email: str, tenant_id: str, role: str, username: str) -> None:
+    """Upsert an allowlist entry. RLS enforces role-on-role constraints.
+
+    Raises ValueError if (tenant_id, username) is already taken in users or the allowlist.
+    """
+    print(f"Called admin_add_to_allowlist with email={email}, tenant_id={tenant_id}, role={role}, username={username}")
     supabase = get_supabase_for_user(_require_token())
+    available = supabase.rpc(
+        "check_username_available",
+        {"p_tenant_id": tenant_id, "p_username": username, "p_exclude_email": email.lower()},
+    ).execute()
+    if not available.data:
+        raise ValueError(f"Username '{username}' is already taken in this tenant.")
     supabase.table("tenant_email_allowlist").upsert(
-        {"email": email.lower(), "tenant_id": tenant_id, "role": role}
+        {"email": email.lower(), "tenant_id": tenant_id, "username": username, "role": role}
     ).execute()
 
 
@@ -205,7 +219,7 @@ def admin_remove_from_allowlist(email: str) -> None:
 def admin_list_allowlist(tenant_id: Optional[str] = None) -> list[dict[str, Any]]:
     """List allowlist entries. RLS scopes results to what the caller may see."""
     supabase = get_supabase_for_user(_require_token())
-    query = supabase.table("tenant_email_allowlist").select("email, tenant_id, role, created_at")
+    query = supabase.table("tenant_email_allowlist").select("email, username, tenant_id, role, created_at")
     if tenant_id:
         query = query.eq("tenant_id", tenant_id)
     r = query.execute()
@@ -227,10 +241,14 @@ async def api_list_org_users():
 # ---------------------------------------------------------------------------
 # Shared Panel component: "Users Awaiting Login" (allowlist entries)
 # ---------------------------------------------------------------------------
-def make_pending_users_panel(tenant_id: Optional[str], on_refresh) -> pn.Column:
+def make_pending_users_panel(tenant_id: Optional[str], on_refresh, ctx) -> pn.Column:
     """
     Returns a Panel Column listing allowlist entries for *tenant_id* with a
     Remove button on each row.  Call on_refresh() after a removal to rebuild.
+
+    ctx must be the copy_context() snapshot from the parent Panel app so that
+    Remove-button callbacks (fired by Bokeh outside any ctx.run) can reach
+    Supabase via _require_token().
     """
     try:
         entries = admin_list_allowlist(tenant_id)
@@ -243,20 +261,23 @@ def make_pending_users_panel(tenant_id: Optional[str], on_refresh) -> pn.Column:
     rows = []
     for entry in entries:
         email = entry["email"]
+        username = entry.get("username") or "—"
         role = entry["role"]
         remove_btn = pn.widgets.Button(name="Remove", button_type="danger", width=90)
 
         def _on_remove(event, _email=email):
-            try:
-                admin_remove_from_allowlist(_email)
-            except Exception as exc:
-                logger.exception("admin_remove_from_allowlist")
-            on_refresh()
+            def _inner():
+                try:
+                    admin_remove_from_allowlist(_email)
+                except Exception as exc:
+                    logger.exception("admin_remove_from_allowlist")
+                on_refresh()
+            ctx.run(_inner)
 
         remove_btn.on_click(_on_remove)
         rows.append(
             pn.Row(
-                pn.pane.Markdown(f"**{email}** — `{role}`", width=420),
+                pn.pane.Markdown(f"**{email}** (`{username}`) — `{role}`", width=440),
                 remove_btn,
             )
         )
@@ -269,16 +290,31 @@ def make_pending_users_panel(tenant_id: Optional[str], on_refresh) -> pn.Column:
 # ---------------------------------------------------------------------------
 @add_application("/panel", app=app, title="Organization")
 def create_panel_app():
+    # Capture ContextVars (access_token, email) from the HTTP request that
+    # initialises this Panel session.  Button-click callbacks run via
+    # Bokeh/Tornado's IO loop in a different context, so we restore the
+    # snapshot with ctx.run() on every callback that touches Supabase.
+    ctx = copy_context()
+
     main_md = pn.pane.Markdown("", sizing_mode="stretch_width")
     refresh_btn = pn.widgets.Button(name="Refresh members", button_type="primary")
     logout_md = pn.pane.Markdown("[Log out](/auth/logout)")
+    tenant_admin_md = pn.pane.Markdown("[Tenant Admin](/tenantadmin)")
+    user_admin_md = pn.pane.Markdown("[User Admin](/admin)")
 
     def update_view(event=None):
         if not _token():
             main_md.object = "[Log in with Google](/auth/login)"
             refresh_btn.visible = False
             logout_md.visible = False
+            tenant_admin_md.visible = False
+            user_admin_md.visible = False
             return
+
+        user_info = get_current_user_info()
+        tenant_admin_md.visible = user_info.get("role") in SAASCO_STAFF_ROLES
+        user_admin_md.visible = user_info.get("role") in TENANT_ADMIN_ROLES
+
         refresh_btn.visible = True
         logout_md.visible = True
         email = user_email_ctx.get() or "—"
@@ -314,11 +350,12 @@ def create_panel_app():
                 lines.append(f"- **{name}** — {mail or '—'} `{role}`")
         main_md.object = "\n".join(lines)
 
-    refresh_btn.on_click(update_view)
-    update_view()
+    refresh_btn.on_click(lambda e: ctx.run(update_view, e))
+    ctx.run(update_view)
 
     return pn.Column(
         main_md,
+        pn.Row(tenant_admin_md, user_admin_md),
         pn.Row(refresh_btn, logout_md),
         sizing_mode="stretch_width",
     )
@@ -329,6 +366,8 @@ def create_panel_app():
 # ---------------------------------------------------------------------------
 @add_application("/admin", app=app, title="Tenant Admin")
 def create_admin_app():
+    ctx = copy_context()
+
     if not _token():
         return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
 
@@ -353,34 +392,42 @@ def create_admin_app():
         available_roles = ["user"]
 
     email_input = pn.widgets.TextInput(name="Email", placeholder="user@example.com", width=300)
+    username_input = pn.widgets.TextInput(name="Username", placeholder="user1", width=200)
     role_select = pn.widgets.Select(name="Role", options=available_roles, value="user", width=160)
     add_btn = pn.widgets.Button(name="Add to Allowlist", button_type="primary")
     status_md = pn.pane.Markdown("")
     pending_col = pn.Column()
 
     def refresh_pending(*_):
-        pending_col.objects = [make_pending_users_panel(tenant_id, refresh_pending)]
+        pending_col.objects = [make_pending_users_panel(tenant_id, refresh_pending, ctx)]
 
     def on_add(event=None):
-        email = email_input.value.strip()
-        if not email:
-            status_md.object = "_Please enter an email address._"
-            return
-        try:
-            admin_add_to_allowlist(email, tenant_id, role_select.value)
-            status_md.object = f"Added **{email}** with role `{role_select.value}`."
-            email_input.value = ""
-            refresh_pending()
-        except Exception as e:
-            status_md.object = f"_Error: {e}_"
+        def _inner():
+            email = email_input.value.strip()
+            username = username_input.value.strip()
+            if not email:
+                status_md.object = "_Please enter an email address._"
+                return
+            if not username:
+                status_md.object = "_Please enter a username._"
+                return
+            try:
+                admin_add_to_allowlist(email, tenant_id, role_select.value, username)
+                status_md.object = f"Added **{email}** (`{username}`) with role `{role_select.value}`."
+                email_input.value = ""
+                username_input.value = ""
+                refresh_pending()
+            except Exception as e:
+                status_md.object = f"_Error: {e}_"
+        ctx.run(_inner)
 
     add_btn.on_click(on_add)
-    refresh_pending()
+    ctx.run(refresh_pending)
 
     return pn.Column(
         "## Tenant Admin",
         "### Add User to Allowlist",
-        pn.Row(email_input, role_select, add_btn),
+        pn.Row(email_input, username_input, role_select, add_btn),
         status_md,
         pn.layout.Divider(),
         "### Users Awaiting Login",
@@ -396,6 +443,8 @@ def create_admin_app():
 # ---------------------------------------------------------------------------
 @add_application("/tenantadmin", app=app, title="SaasCo Admin")
 def create_tenantadmin_app():
+    ctx = copy_context()
+
     if not _token():
         return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
 
@@ -436,6 +485,9 @@ def create_tenantadmin_app():
     email_input = pn.widgets.TextInput(
         name="Email", placeholder="user@example.com", width=300
     )
+    username_input = pn.widgets.TextInput(
+        name="Username", placeholder="user1", width=200
+    )
     role_select = pn.widgets.Select(
         name="Role", options=available_roles, value="user", width=180
     )
@@ -447,42 +499,51 @@ def create_tenantadmin_app():
 
     def refresh_pending(*_):
         tid = tenant_select.value
-        pending_col.objects = [make_pending_users_panel(tid, refresh_pending)]
+        pending_col.objects = [make_pending_users_panel(tid, refresh_pending, ctx)]
 
     def on_create_tenant(event=None):
-        name = tenant_name_input.value.strip()
-        if not name:
-            create_tenant_status.object = "_Please enter a tenant name._"
-            return
-        try:
-            new_id = admin_create_tenant(name)
-            create_tenant_status.object = f"Created **{name}** (`{new_id}`)"
-            tenant_name_input.value = ""
-            tenant_select.options = _tenant_options()
-        except Exception as e:
-            create_tenant_status.object = f"_Error: {e}_"
+        def _inner():
+            name = tenant_name_input.value.strip()
+            if not name:
+                create_tenant_status.object = "_Please enter a tenant name._"
+                return
+            try:
+                new_id = admin_create_tenant(name)
+                create_tenant_status.object = f"Created **{name}** (`{new_id}`)"
+                tenant_name_input.value = ""
+                tenant_select.options = _tenant_options()  # already inside ctx.run
+            except Exception as e:
+                create_tenant_status.object = f"_Error: {e}_"
+        ctx.run(_inner)
 
     def on_add_user(event=None):
-        email = email_input.value.strip()
-        tid = tenant_select.value
-        if not email or not tid:
-            add_user_status.object = "_Please select a tenant and enter an email._"
-            return
-        try:
-            admin_add_to_allowlist(email, tid, role_select.value)
-            add_user_status.object = f"Added **{email}** with role `{role_select.value}`."
-            email_input.value = ""
-            refresh_pending()
-        except Exception as e:
-            add_user_status.object = f"_Error: {e}_"
+        def _inner():
+            email = email_input.value.strip()
+            username = username_input.value.strip()
+            tid = tenant_select.value
+            if not email or not tid:
+                add_user_status.object = "_Please select a tenant and enter an email._"
+                return
+            if not username:
+                add_user_status.object = "_Please enter a username._"
+                return
+            try:
+                admin_add_to_allowlist(email, tid, role_select.value, username)
+                add_user_status.object = f"Added **{email}** (`{username}`) with role `{role_select.value}`."
+                email_input.value = ""
+                username_input.value = ""
+                refresh_pending()
+            except Exception as e:
+                add_user_status.object = f"_Error: {e}_"
+        ctx.run(_inner)
 
     def on_tenant_change(event=None):
-        refresh_pending()
+        ctx.run(refresh_pending)
 
     create_tenant_btn.on_click(on_create_tenant)
     add_user_btn.on_click(on_add_user)
     tenant_select.param.watch(on_tenant_change, "value")
-    refresh_pending()
+    ctx.run(refresh_pending)
 
     return pn.Column(
         "## SaasCo Admin",
@@ -494,7 +555,7 @@ def create_tenantadmin_app():
         "### Manage Tenant Users",
         tenant_select,
         "#### Add User to Allowlist",
-        pn.Row(email_input, role_select, add_user_btn),
+        pn.Row(email_input, username_input, role_select, add_user_btn),
         add_user_status,
         "#### Users Awaiting Login",
         pending_col,
