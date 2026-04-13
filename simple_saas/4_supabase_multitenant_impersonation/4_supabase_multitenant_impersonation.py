@@ -10,16 +10,20 @@ Multi-tenant ReBAC MVP: Supabase + FastAPI + Panel.
     /panel       — user view (org member list)
     /admin       — tenant admin/superuser: manage users in their tenant
     /tenantadmin — SaasCo staff: manage tenants and all tenant users
+- Impersonation:
+    /auth/impersonate/{user_id} — admin starts impersonating a user
+    /auth/stop-impersonation    — return to admin's own session
 
 Run: uvicorn 3_supabase_multitenant_admin:app --reload --port 8000
-Set SUPABASE_APP_URL, SUPABASE_API_KEY in .env.
+Set SUPABASE_APP_URL, SUPABASE_API_KEY, SUPABASE_SERVICE_ROLE_KEY in .env.
 Optional: AUTH_REDIRECT_URL, SESSION_SECRET_KEY (openssl rand -hex 32).
-Apply migration1.sql in Supabase before running.
+Apply migration1.sql then migration2_impersonation.sql in Supabase before running.
 """
 
 import logging
 import os
 from contextvars import ContextVar, copy_context
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import panel as pn
@@ -42,21 +46,41 @@ pn.extension()
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.environ["SUPABASE_APP_URL"].rstrip("/")
 SUPABASE_ANON_KEY = os.environ["SUPABASE_API_KEY"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 AUTH_REDIRECT_URL = os.environ.get("AUTH_REDIRECT_URL", "http://127.0.0.1:8000/auth/callback")
 SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", os.urandom(32).hex())
 if not os.environ.get("SESSION_SECRET_KEY"):
     logger.warning(
         "SESSION_SECRET_KEY not set; using a random value. Sessions will not persist across restarts."
     )
+if not SUPABASE_SERVICE_ROLE_KEY:
+    logger.warning(
+        "SUPABASE_SERVICE_ROLE_KEY not set; impersonation will not work."
+    )
 
 # Request-scoped auth (set by middleware)
+# access_token_ctx: effective token — impersonation token when active, else admin's token
 access_token_ctx: ContextVar[Optional[str]] = ContextVar("access_token", default=None)
+# admin_token_ctx: always the logged-in admin's real token, even during impersonation
+admin_token_ctx: ContextVar[Optional[str]] = ContextVar("admin_token", default=None)
 user_email_ctx: ContextVar[Optional[str]] = ContextVar("user_email", default=None)
+# impersonated_user_ctx: set when impersonation is active; contains target user's info dict
+impersonated_user_ctx: ContextVar[Optional[dict]] = ContextVar("impersonated_user", default=None)
+# impersonator_id_ctx: the admin's user_id when impersonation is active; used to set x-impersonator-id header
+impersonator_id_ctx: ContextVar[Optional[str]] = ContextVar("impersonator_id", default=None)
 
 # Roles that can access /admin (tenant-level admin)
 TENANT_ADMIN_ROLES = {"saasco_superuser", "saasco_employee", "tenant_superuser", "tenant_admin"}
 # Roles that can access /tenantadmin (SaasCo staff only)
 SAASCO_STAFF_ROLES = {"saasco_superuser", "saasco_employee"}
+
+# Which roles each admin role may impersonate (role-on-role constraints)
+_IMPERSONATABLE_ROLES: dict[str, set[str]] = {
+    "saasco_superuser": {"saasco_superuser", "saasco_employee", "tenant_superuser", "tenant_admin", "user"},
+    "saasco_employee":  {"tenant_superuser", "tenant_admin", "user"},
+    "tenant_superuser": {"tenant_admin", "user"},
+    "tenant_admin":     {"user"},
+}
 
 
 def _supabase_auth_client() -> Client:
@@ -64,12 +88,34 @@ def _supabase_auth_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY, ClientOptions(flow_type="pkce"))
 
 
-def get_supabase_for_user(access_token: Optional[str]) -> Client:
-    """Supabase client with user JWT so RLS applies."""
+def get_supabase_for_user(
+    access_token: Optional[str],
+    impersonator_id: Optional[str] = None,
+) -> Client:
+    """Supabase client with user JWT so RLS applies.
+
+    When impersonator_id is set, adds an x-impersonator-id request header.
+    PostgREST exposes this as request.headers in PostgreSQL, allowing audit
+    triggers to record both the effective user (auth.uid()) and the real actor.
+    """
     opts = ClientOptions()
+    headers: dict[str, str] = {}
     if access_token:
-        opts.headers = {"Authorization": f"Bearer {access_token}"}
+        headers["Authorization"] = f"Bearer {access_token}"
+    if impersonator_id:
+        headers["x-impersonator-id"] = impersonator_id
+    if headers:
+        opts.headers = headers
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=opts)
+
+
+def get_supabase_admin() -> Client:
+    """Service-role client — bypasses RLS. Use only for privileged server-side operations."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY is not set. Cannot perform admin operations."
+        )
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +124,57 @@ def get_supabase_for_user(access_token: Optional[str]) -> Client:
 class AuthContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         session = getattr(request, "session", None)
-        token = request.session.get("access_token") if session else None
+        admin_token = request.session.get("access_token") if session else None
         email = request.session.get("email") if session else None
-        token_ctx = access_token_ctx.set(token)
-        email_ctx = user_email_ctx.set(email)
+        impersonation = request.session.get("impersonation") if session else None
+
+        # Auto-expire impersonation sessions whose token TTL has passed.
+        # This prevents stale impersonation tokens from reaching Panel callbacks
+        # when the admin returns to a tab after a long absence.
+        if impersonation:
+            expires_at_raw = impersonation.get("expires_at")
+            if expires_at_raw:
+                try:
+                    expires_at = datetime.fromisoformat(expires_at_raw)
+                    if datetime.now(timezone.utc) >= expires_at:
+                        logger.info(
+                            "Impersonation token expired for target=%s; auto-clearing",
+                            impersonation.get("user_info", {}).get("user_email"),
+                        )
+                        request.session.pop("impersonation", None)
+                        impersonation = None
+                except ValueError:
+                    pass  # malformed date; leave impersonation intact
+
+        # Effective token: fetch from DB when impersonation is active (token not in cookie)
+        effective_token: Optional[str] = admin_token
+        if impersonation:
+            session_id = impersonation.get("session_id")
+            if session_id:
+                try:
+                    effective_token = _fetch_impersonation_token(session_id)
+                except Exception:
+                    logger.exception("middleware: failed to fetch impersonation token for session %s", session_id)
+                    effective_token = None
+            else:
+                # Legacy: token stored directly in cookie (should not occur after this deploy)
+                effective_token = impersonation.get("access_token")
+        impersonated_user = impersonation.get("user_info") if impersonation else None
+        impersonator_id = impersonation.get("impersonator_id") if impersonation else None
+
+        t_ctx = access_token_ctx.set(effective_token)
+        a_ctx = admin_token_ctx.set(admin_token)
+        e_ctx = user_email_ctx.set(email)
+        i_ctx = impersonated_user_ctx.set(impersonated_user)
+        imp_id_ctx = impersonator_id_ctx.set(impersonator_id)
         try:
             return await call_next(request)
         finally:
-            access_token_ctx.reset(token_ctx)
-            user_email_ctx.reset(email_ctx)
+            access_token_ctx.reset(t_ctx)
+            admin_token_ctx.reset(a_ctx)
+            user_email_ctx.reset(e_ctx)
+            impersonated_user_ctx.reset(i_ctx)
+            impersonator_id_ctx.reset(imp_id_ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -134,15 +222,131 @@ async def auth_logout(request: Request):
     return RedirectResponse(url="/", status_code=302)
 
 
+@app.get("/auth/impersonate/{user_id}")
+async def auth_impersonate(request: Request, user_id: str, reason: str = ""):
+    """Start impersonating a user. Validates permissions, generates a session token
+    for the target user via magic link, then stores it in the session cookie."""
+    admin_token = request.session.get("access_token")
+    if not admin_token:
+        return RedirectResponse("/auth/login")
+
+    # Prevent nested impersonation
+    if request.session.get("impersonation"):
+        logger.warning("Attempted to start impersonation while already impersonating")
+        return RedirectResponse("/panel")
+
+    # Get admin's own info using their real token
+    try:
+        admin_info = _get_user_info_by_token_and_email(
+            admin_token, request.session.get("email", "")
+        )
+    except Exception:
+        logger.exception("auth_impersonate: failed to get admin info")
+        return RedirectResponse("/panel")
+
+    if not admin_info or admin_info.get("role") not in TENANT_ADMIN_ROLES:
+        return RedirectResponse("/panel")
+
+    # Look up target user via service role (admin may be in a different tenant)
+    try:
+        target_info = _get_user_by_id_admin(user_id)
+    except Exception:
+        logger.exception("auth_impersonate: failed to get target user")
+        return RedirectResponse("/panel")
+
+    if not target_info:
+        logger.warning("auth_impersonate: target user %s not found", user_id)
+        return RedirectResponse("/panel")
+
+    if not can_impersonate(admin_info, target_info):
+        logger.warning(
+            "auth_impersonate: %s (role=%s) not permitted to impersonate %s (role=%s)",
+            admin_info.get("user_id"),
+            admin_info.get("role"),
+            user_id,
+            target_info.get("role"),
+        )
+        return RedirectResponse("/panel")
+
+    # Obtain a real JWT for the target user via magic link exchange
+    try:
+        impersonation_token = _generate_impersonation_token(target_info["user_email"])
+    except Exception:
+        logger.exception("auth_impersonate: failed to generate impersonation token")
+        return RedirectResponse("/panel")
+
+    # Record audit row and store the token server-side; return the row UUID.
+    # The JWT (~1.4 KB) is NOT stored in the cookie — only the UUID reference
+    # is, keeping the session well under the 4096-byte cookie limit.
+    try:
+        session_id = _record_impersonation_session(
+            admin_info, target_info, reason, impersonation_token
+        )
+    except Exception:
+        logger.exception("auth_impersonate: failed to record audit log")
+        return RedirectResponse("/panel")
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    request.session["impersonation"] = {
+        "session_id": session_id,
+        "user_info": target_info,
+        "impersonator_id": admin_info["user_id"],
+        "expires_at": expires_at,
+    }
+    logger.info(
+        "IMPERSONATION DEBUG session keys=%s session_id=%s",
+        list(request.session.keys()),
+        session_id,
+    )
+    logger.info(
+        "Impersonation started: %s -> %s",
+        admin_info.get("user_email", admin_info["user_id"]),
+        target_info["user_email"],
+    )
+    return RedirectResponse("/panel", status_code=302)
+
+
+@app.get("/auth/stop-impersonation")
+async def auth_stop_impersonation(request: Request):
+    """End impersonation and return to admin's normal session."""
+    impersonation = request.session.pop("impersonation", None)
+    if impersonation:
+        # Mark session as ended in the audit log
+        try:
+            supabase_admin = get_supabase_admin()
+            session_id = impersonation.get("session_id")
+            if session_id:
+                supabase_admin.table("impersonation_sessions").update(
+                    {"ended_at": datetime.now(timezone.utc).isoformat()}
+                ).eq("id", session_id).execute()
+            else:
+                # Legacy fallback
+                supabase_admin.table("impersonation_sessions").update(
+                    {"ended_at": datetime.now(timezone.utc).isoformat()}
+                ).eq("impersonator_id", impersonation["impersonator_id"]).eq(
+                    "target_user_id", impersonation["user_info"]["user_id"]
+                ).is_("ended_at", "null").execute()
+        except Exception:
+            logger.exception("stop_impersonation: failed to update audit log (non-fatal)")
+
+        logger.info(
+            "Impersonation ended: impersonator=%s target=%s",
+            impersonation["impersonator_id"],
+            impersonation["user_info"].get("user_email"),
+        )
+    return RedirectResponse("/panel", status_code=302)
+
+
 @app.get("/")
 async def root():
     return RedirectResponse(url="/panel", status_code=302)
 
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Token helpers
 # ---------------------------------------------------------------------------
 def _token() -> Optional[str]:
+    """Effective token: impersonation token when active, otherwise admin's token."""
     return access_token_ctx.get()
 
 
@@ -153,23 +357,161 @@ def _require_token() -> str:
     return t
 
 
+def _admin_token() -> Optional[str]:
+    """The real logged-in admin's token, unaffected by impersonation."""
+    return admin_token_ctx.get()
+
+
+def _require_admin_token() -> str:
+    t = _admin_token()
+    if not t:
+        raise PermissionError("Not authenticated. Go to /auth/login")
+    return t
+
+
+def _get_supabase_effective() -> Client:
+    """The single authorised way to obtain a Supabase client for user-facing
+    data operations.
+
+    - Uses the effective token (impersonation JWT when active, admin JWT otherwise),
+      so RLS is enforced as the correct effective user.
+    - Attaches x-impersonator-id when impersonation is active so that
+      PostgreSQL audit triggers can record both the effective user (auth.uid())
+      and the real actor (current_impersonator_id()).
+
+    Admin-only operations (allowlist management, tenant creation, etc.) should
+    continue to call get_supabase_for_user(_require_admin_token()) directly —
+    those actions are performed as the admin and need no impersonation header.
+    """
+    return get_supabase_for_user(
+        _require_token(),
+        impersonator_id=impersonator_id_ctx.get(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Impersonation helpers
+# ---------------------------------------------------------------------------
+def can_impersonate(admin_info: dict, target_info: dict) -> bool:
+    """Return True if admin_info's role may impersonate target_info's role/tenant."""
+    admin_role = admin_info.get("role", "")
+    target_role = target_info.get("role", "")
+
+    # Prevent self-impersonation
+    if admin_info.get("user_id") == target_info.get("user_id"):
+        return False
+
+    allowed_roles = _IMPERSONATABLE_ROLES.get(admin_role, set())
+    if target_role not in allowed_roles:
+        return False
+
+    # Tenant-scoped admins may only impersonate within their own tenant
+    if admin_role in ("tenant_superuser", "tenant_admin"):
+        return admin_info.get("tenant_id") == target_info.get("tenant_id")
+
+    return True
+
+
+def _generate_impersonation_token(target_email: str) -> str:
+    """Use the admin API to mint a magic-link OTP, then exchange it for a real
+    access token for the target user.  The resulting JWT has auth.uid() ==
+    target user's UUID, so all existing RLS policies work unchanged."""
+    print("Getting supabase admin session")
+    supabase_admin = get_supabase_admin()
+
+    print("Generating link")
+    link_resp = supabase_admin.auth.admin.generate_link(
+        {"type": "magiclink", "email": target_email}
+    )
+    hashed_token = link_resp.properties.hashed_token
+    print(f"Got hashed token {hashed_token}")
+
+    anon_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    print("Client created")
+    # hashed_token from generate_link is already the stored hash.
+    # Pass it as token_hash (not token) so GoTrue looks it up directly
+    # rather than hashing it again.  Type must be "email" — that is how
+    # GoTrue stores magic-link OTPs internally regardless of the link type
+    # requested via generate_link.
+    otp_resp = anon_client.auth.verify_otp(
+        {"token_hash": hashed_token, "type": "email"}
+    )
+    # Checkpoint 1: did verify_otp return a session at all?
+    logger.info(
+        "IMPERSONATION DEBUG verify_otp: user=%s session_present=%s token_present=%s",
+        getattr(getattr(otp_resp, "user", None), "email", None),
+        otp_resp.session is not None,
+        bool(getattr(otp_resp.session, "access_token", None)) if otp_resp.session else False,
+    )
+    if otp_resp.session is None:
+        raise RuntimeError(
+            f"verify_otp succeeded but returned no session for {target_email}. "
+            "This usually means Supabase requires email confirmation for this user."
+        )
+    return otp_resp.session.access_token
+
+
+def _record_impersonation_session(
+    admin_info: dict, target_info: dict, reason: str, access_token: str
+) -> str:
+    """Insert an audit row and return the new session UUID."""
+    supabase_admin = get_supabase_admin()
+    r = supabase_admin.table("impersonation_sessions").insert(
+        {
+            "impersonator_id": admin_info["user_id"],
+            "target_user_id": target_info["user_id"],
+            "target_email": target_info["user_email"],
+            "target_tenant_id": target_info["tenant_id"],
+            "reason": reason,
+            "access_token": access_token,
+        }
+    ).execute()
+    return r.data[0]["id"]
+
+
+def _fetch_impersonation_token(session_id: str) -> Optional[str]:
+    """Look up the impersonation JWT from the DB by session UUID."""
+    supabase_admin = get_supabase_admin()
+    r = (
+        supabase_admin.table("impersonation_sessions")
+        .select("access_token")
+        .eq("id", session_id)
+        .single()
+        .execute()
+    )
+    return (r.data or {}).get("access_token")
+
+
+# ---------------------------------------------------------------------------
+# Data helpers (user-facing — use effective token; RLS applies as target user)
+# ---------------------------------------------------------------------------
 def list_org_users() -> list[dict[str, Any]]:
-    """Users in the current user's tenant (RLS-scoped)."""
-    print("Called list_org_users")
-    supabase = get_supabase_for_user(_require_token())
+    """Users in the current user's tenant (RLS-scoped).
+    During impersonation this shows what the target user sees, and the
+    x-impersonator-id header is attached for audit attribution."""
+    supabase = _get_supabase_effective()
     r = supabase.table("users").select("user_id, username, user_email, tenant_id, role").execute()
     return list(r.data or [])
 
 
 def get_current_user_info() -> Optional[dict[str, Any]]:
-    """Returns {user_id, role, tenant_id} for the current user, or None."""
-    print("Called get_current_user_info")
+    """Returns {user_id, role, tenant_id} for the *effective* user.
+    During impersonation this is the target user's info."""
     token = _token()
-    email = user_email_ctx.get()
-    if not token or not email:
+    if not token:
+        return None
+
+    impersonated = impersonated_user_ctx.get()
+    if impersonated:
+        # Use target's known email to query via the impersonation token
+        email = impersonated.get("user_email", "")
+    else:
+        email = user_email_ctx.get() or ""
+
+    if not email:
         return None
     try:
-        supabase = get_supabase_for_user(token)
+        supabase = _get_supabase_effective()
         r = supabase.table("users").select("user_id, role, tenant_id").eq("user_email", email).execute()
         return r.data[0] if r.data else None
     except Exception:
@@ -177,18 +519,91 @@ def get_current_user_info() -> Optional[dict[str, Any]]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Data helpers (admin-facing — use admin token; RLS applies as the real admin)
+# ---------------------------------------------------------------------------
+def get_admin_user_info() -> Optional[dict[str, Any]]:
+    """Returns {user_id, role, tenant_id} for the real logged-in admin.
+    Unaffected by impersonation state."""
+    token = _admin_token()
+    email = user_email_ctx.get()
+    if not token or not email:
+        return None
+    try:
+        supabase = get_supabase_for_user(token)
+        r = supabase.table("users").select("user_id, role, tenant_id, user_email").eq("user_email", email).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        logger.exception("get_admin_user_info")
+        return None
+
+
+def _get_user_info_by_token_and_email(token: str, email: str) -> Optional[dict[str, Any]]:
+    """Look up a user row using a specific token + email (used during HTTP routes
+    where ContextVars are not yet set)."""
+    if not token or not email:
+        return None
+    try:
+        supabase = get_supabase_for_user(token)
+        r = supabase.table("users").select("user_id, role, tenant_id, user_email").eq("user_email", email).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        logger.exception("_get_user_info_by_token_and_email")
+        return None
+
+
+def _get_user_by_id_admin(user_id: str) -> Optional[dict[str, Any]]:
+    """Fetch a user row by user_id using the service role (bypasses RLS).
+    Required when the admin and target are in different tenants."""
+    supabase_admin = get_supabase_admin()
+    r = (
+        supabase_admin.table("users")
+        .select("user_id, username, user_email, role, tenant_id")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return r.data[0] if r.data else None
+
+
 def list_tenants() -> list[dict[str, Any]]:
-    """All tenants visible to the current user (RLS-scoped)."""
-    print("Called list_tenants")
-    supabase = get_supabase_for_user(_require_token())
+    """All tenants visible to the real admin (RLS-scoped via admin token)."""
+    supabase = get_supabase_for_user(_require_admin_token())
     r = supabase.table("tenants").select("id, name").order("name").execute()
+    return list(r.data or [])
+
+
+def list_users_for_tenant(tenant_id: str) -> list[dict[str, Any]]:
+    """Active (logged-in) users for a specific tenant. Uses admin token so RLS
+    allows cross-tenant access for SaasCo staff."""
+    supabase = get_supabase_for_user(_require_admin_token())
+    r = (
+        supabase.table("users")
+        .select("user_id, username, user_email, role, tenant_id, tenants(name)")
+        .eq("tenant_id", tenant_id)
+        .order("username")
+        .execute()
+    )
+    return list(r.data or [])
+
+
+def list_all_accessible_users() -> list[dict[str, Any]]:
+    """All active users visible to the admin via RLS on the admin token.
+    SaasCo staff see every tenant; tenant admins/superusers see their own tenant.
+    Includes tenant name via an embedded join for display."""
+    supabase = get_supabase_for_user(_require_admin_token())
+    r = (
+        supabase.table("users")
+        .select("user_id, username, user_email, role, tenant_id, tenants(name)")
+        .order("tenant_id")
+        .order("username")
+        .execute()
+    )
     return list(r.data or [])
 
 
 def admin_create_tenant(name: str) -> str:
     """Create a new tenant (RLS restricts to SaasCo staff). Returns new tenant id."""
-    print("Called admin_create_tenant with name:", name)
-    supabase = get_supabase_for_user(_require_token())
+    supabase = get_supabase_for_user(_require_admin_token())
     r = supabase.table("tenants").insert({"name": name}).execute()
     return r.data[0]["id"]
 
@@ -198,8 +613,7 @@ def admin_add_to_allowlist(email: str, tenant_id: str, role: str, username: str)
 
     Raises ValueError if (tenant_id, username) is already taken in users or the allowlist.
     """
-    print(f"Called admin_add_to_allowlist with email={email}, tenant_id={tenant_id}, role={role}, username={username}")
-    supabase = get_supabase_for_user(_require_token())
+    supabase = get_supabase_for_user(_require_admin_token())
     available = supabase.rpc(
         "check_username_available",
         {"p_tenant_id": tenant_id, "p_username": username, "p_exclude_email": email.lower()},
@@ -212,13 +626,13 @@ def admin_add_to_allowlist(email: str, tenant_id: str, role: str, username: str)
 
 
 def admin_remove_from_allowlist(email: str) -> None:
-    supabase = get_supabase_for_user(_require_token())
+    supabase = get_supabase_for_user(_require_admin_token())
     supabase.table("tenant_email_allowlist").delete().eq("email", email.lower()).execute()
 
 
 def admin_list_allowlist(tenant_id: Optional[str] = None) -> list[dict[str, Any]]:
-    """List allowlist entries. RLS scopes results to what the caller may see."""
-    supabase = get_supabase_for_user(_require_token())
+    """List allowlist entries. RLS scopes results to what the admin may see."""
+    supabase = get_supabase_for_user(_require_admin_token())
     query = supabase.table("tenant_email_allowlist").select("email, username, tenant_id, role, created_at")
     if tenant_id:
         query = query.eq("tenant_id", tenant_id)
@@ -239,6 +653,29 @@ async def api_list_org_users():
 
 
 # ---------------------------------------------------------------------------
+# Shared Panel component: impersonation banner
+# ---------------------------------------------------------------------------
+def make_impersonation_banner() -> Optional[pn.viewable.Viewable]:
+    """Returns a warning banner when impersonation is active, else None."""
+    impersonated = impersonated_user_ctx.get()
+    if not impersonated:
+        return None
+    email = impersonated.get("user_email", "unknown")
+    role = impersonated.get("role", "")
+    return pn.pane.Markdown(
+        f"**Impersonation active** — viewing as **{email}** (`{role}`) "
+        f"&nbsp;&nbsp;[Stop impersonation](/auth/stop-impersonation)",
+        styles={
+            "background-color": "#fff3cd",
+            "border": "1px solid #ffc107",
+            "border-radius": "4px",
+            "padding": "8px 12px",
+        },
+        sizing_mode="stretch_width",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared Panel component: "Users Awaiting Login" (allowlist entries)
 # ---------------------------------------------------------------------------
 def make_pending_users_panel(tenant_id: Optional[str], on_refresh, ctx) -> pn.Column:
@@ -248,7 +685,7 @@ def make_pending_users_panel(tenant_id: Optional[str], on_refresh, ctx) -> pn.Co
 
     ctx must be the copy_context() snapshot from the parent Panel app so that
     Remove-button callbacks (fired by Bokeh outside any ctx.run) can reach
-    Supabase via _require_token().
+    Supabase via _require_admin_token().
     """
     try:
         entries = admin_list_allowlist(tenant_id)
@@ -269,7 +706,7 @@ def make_pending_users_panel(tenant_id: Optional[str], on_refresh, ctx) -> pn.Co
             def _inner():
                 try:
                     admin_remove_from_allowlist(_email)
-                except Exception as exc:
+                except Exception:
                     logger.exception("admin_remove_from_allowlist")
                 on_refresh()
             ctx.run(_inner)
@@ -286,6 +723,51 @@ def make_pending_users_panel(tenant_id: Optional[str], on_refresh, ctx) -> pn.Co
 
 
 # ---------------------------------------------------------------------------
+# Shared Panel component: "Active Users" with impersonate buttons
+# ---------------------------------------------------------------------------
+def make_active_users_panel(
+    admin_info: dict,
+    tenant_id: Optional[str] = None,
+) -> pn.Column:
+    """Lists active (logged-in) users with Impersonate links.
+
+    If tenant_id is given, shows only that tenant's users.
+    If omitted, shows every user visible to the admin via RLS — useful for
+    SaasCo staff who need to impersonate across tenants for async debugging.
+    Tenant name is included in each row when showing the full cross-tenant list.
+    """
+    show_tenant = tenant_id is None
+    try:
+        users = list_all_accessible_users() if show_tenant else list_users_for_tenant(tenant_id)
+    except Exception as e:
+        return pn.Column(pn.pane.Markdown(f"_Error loading active users: {e}_"))
+
+    if not users:
+        return pn.Column(pn.pane.Markdown("_No active users found._"))
+
+    rows = []
+    for u in users:
+        uid = u["user_id"]
+        email = u.get("user_email", "—")
+        username = u.get("username") or "—"
+        role = u.get("role", "")
+        tenant_name = (u.get("tenants") or {}).get("name", "") if show_tenant else ""
+
+        identity = f"**{username}** — {email} `{role}`"
+        if tenant_name:
+            identity += f" · _{tenant_name}_"
+
+        if can_impersonate(admin_info, u):
+            action = pn.pane.Markdown(f"[Impersonate](/auth/impersonate/{uid})", width=150)
+        else:
+            action = pn.pane.Markdown("_(self or higher role)_", width=150)
+
+        rows.append(pn.Row(pn.pane.Markdown(identity, width=460), action))
+
+    return pn.Column(*rows)
+
+
+# ---------------------------------------------------------------------------
 # Panel app: user view — login link or org member list
 # ---------------------------------------------------------------------------
 @add_application("/panel", app=app, title="Organization")
@@ -294,7 +776,17 @@ def create_panel_app():
     # initialises this Panel session.  Button-click callbacks run via
     # Bokeh/Tornado's IO loop in a different context, so we restore the
     # snapshot with ctx.run() on every callback that touches Supabase.
+
+    # Checkpoint 4: confirm what the Panel factory sees when it initialises
+    logger.info(
+        "IMPERSONATION DEBUG panel_factory: access_token_present=%s impersonated_user=%s",
+        bool(access_token_ctx.get()),
+        (impersonated_user_ctx.get() or {}).get("user_email", "none"),
+    )
+
     ctx = copy_context()
+
+    banner = make_impersonation_banner()
 
     main_md = pn.pane.Markdown("", sizing_mode="stretch_width")
     refresh_btn = pn.widgets.Button(name="Refresh members", button_type="primary")
@@ -311,29 +803,34 @@ def create_panel_app():
             user_admin_md.visible = False
             return
 
+        # Admin links use the effective-user role (hidden during impersonation)
         user_info = get_current_user_info()
-        tenant_admin_md.visible = user_info.get("role") in SAASCO_STAFF_ROLES
-        user_admin_md.visible = user_info.get("role") in TENANT_ADMIN_ROLES
+        effective_role = user_info.get("role") if user_info else None
+        tenant_admin_md.visible = effective_role in SAASCO_STAFF_ROLES
+        user_admin_md.visible = effective_role in TENANT_ADMIN_ROLES
 
         refresh_btn.visible = True
         logout_md.visible = True
-        email = user_email_ctx.get() or "—"
+
+        impersonated = impersonated_user_ctx.get()
+        display_email = impersonated["user_email"] if impersonated else (user_email_ctx.get() or "—")
+
         try:
             rows = list_org_users()
         except PermissionError:
             main_md.object = (
-                f"**Signed in as:** {email}\n\n"
+                f"**Signed in as:** {display_email}\n\n"
                 "_Could not load members (not authenticated)._\n\n"
                 "[Log in with Google](/auth/login)"
             )
             return
         except Exception as e:
             logger.exception("list_org_users in panel")
-            main_md.object = f"**Signed in as:** {email}\n\n_Error loading members: {e}_"
+            main_md.object = f"**Signed in as:** {display_email}\n\n_Error loading members: {e}_"
             return
 
         lines = [
-            f"**Signed in as:** {email}",
+            f"**Signed in as:** {display_email}",
             "",
             "### Users in your organization",
             "",
@@ -353,12 +850,15 @@ def create_panel_app():
     refresh_btn.on_click(lambda e: ctx.run(update_view, e))
     ctx.run(update_view)
 
-    return pn.Column(
+    components: list[Any] = []
+    if banner:
+        components.append(banner)
+    components += [
         main_md,
         pn.Row(tenant_admin_md, user_admin_md),
         pn.Row(refresh_btn, logout_md),
-        sizing_mode="stretch_width",
-    )
+    ]
+    return pn.Column(*components, sizing_mode="stretch_width")
 
 
 # ---------------------------------------------------------------------------
@@ -368,10 +868,13 @@ def create_panel_app():
 def create_admin_app():
     ctx = copy_context()
 
-    if not _token():
+    print("Checking for admin token from /admin request...")
+    if not _admin_token():
         return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
 
-    user_info = get_current_user_info()
+    # Always use admin's real info for access control, even during impersonation
+    print("Get_admin_user_info from /admin request...")
+    user_info = get_admin_user_info()
     if not user_info or user_info.get("role") not in TENANT_ADMIN_ROLES:
         return pn.Column(
             pn.pane.Markdown(
@@ -397,9 +900,21 @@ def create_admin_app():
     add_btn = pn.widgets.Button(name="Add to Allowlist", button_type="primary")
     status_md = pn.pane.Markdown("")
     pending_col = pn.Column()
+    active_users_col = pn.Column()
 
+    print("Function definitions in /admin request...")
     def refresh_pending(*_):
+        print("Calling refresh_pending...")
         pending_col.objects = [make_pending_users_panel(tenant_id, refresh_pending, ctx)]
+        print("Done calling refresh_pending.")
+
+    def refresh_active_users(*_):
+        print("Calling refresh_active_users...")
+        def _inner():
+            print("Calling _inner of refresh_active_users...")
+            active_users_col.objects = [make_active_users_panel(user_info, tenant_id=tenant_id)]
+        ctx.run(_inner)
+        print("Done calling refresh_active_users.")
 
     def on_add(event=None):
         def _inner():
@@ -423,9 +938,15 @@ def create_admin_app():
 
     add_btn.on_click(on_add)
     ctx.run(refresh_pending)
+    refresh_active_users()  # already calls ctx.run(_inner) internally; must not be double-wrapped
 
-    return pn.Column(
-        "## Tenant Admin",
+    print("About to make impersonation banner")
+    banner = make_impersonation_banner()
+    components: list[Any] = []
+    if banner:
+        components.append(banner)
+    components += [
+        "## Admin",
         "### Add User to Allowlist",
         pn.Row(email_input, username_input, role_select, add_btn),
         status_md,
@@ -433,9 +954,12 @@ def create_admin_app():
         "### Users Awaiting Login",
         pending_col,
         pn.layout.Divider(),
+        "### Active Users",
+        active_users_col,
+        pn.layout.Divider(),
         pn.pane.Markdown("[Back to app](/panel) | [Log out](/auth/logout)"),
-        sizing_mode="stretch_width",
-    )
+    ]
+    return pn.Column(*components, sizing_mode="stretch_width")
 
 
 # ---------------------------------------------------------------------------
@@ -445,10 +969,12 @@ def create_admin_app():
 def create_tenantadmin_app():
     ctx = copy_context()
 
-    if not _token():
+    print("Checking for admin token from /tenantadmin request...")
+    if not _admin_token():
         return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
 
-    user_info = get_current_user_info()
+    # Always use admin's real info for access control
+    user_info = get_admin_user_info()
     if not user_info or user_info.get("role") not in SAASCO_STAFF_ROLES:
         return pn.Column(
             pn.pane.Markdown(
@@ -494,12 +1020,20 @@ def create_tenantadmin_app():
     add_user_btn = pn.widgets.Button(name="Add to Allowlist", button_type="primary")
     add_user_status = pn.pane.Markdown("")
 
-    # ---- Pending Users section (reactive on tenant selection) ----
+    # ---- Pending + Active Users sections (reactive on tenant selection) ----
     pending_col = pn.Column()
+    active_users_col = pn.Column()
 
     def refresh_pending(*_):
         tid = tenant_select.value
         pending_col.objects = [make_pending_users_panel(tid, refresh_pending, ctx)]
+
+    def refresh_active_users(*_):
+        def _inner():
+            # Show all users accessible to this admin regardless of the tenant
+            # currently selected in the management dropdown.
+            active_users_col.objects = [make_active_users_panel(user_info)]
+        ctx.run(_inner)
 
     def on_create_tenant(event=None):
         def _inner():
@@ -511,7 +1045,7 @@ def create_tenantadmin_app():
                 new_id = admin_create_tenant(name)
                 create_tenant_status.object = f"Created **{name}** (`{new_id}`)"
                 tenant_name_input.value = ""
-                tenant_select.options = _tenant_options()  # already inside ctx.run
+                tenant_select.options = _tenant_options()
             except Exception as e:
                 create_tenant_status.object = f"_Error: {e}_"
         ctx.run(_inner)
@@ -539,13 +1073,19 @@ def create_tenantadmin_app():
 
     def on_tenant_change(event=None):
         ctx.run(refresh_pending)
+        refresh_active_users()
 
     create_tenant_btn.on_click(on_create_tenant)
     add_user_btn.on_click(on_add_user)
     tenant_select.param.watch(on_tenant_change, "value")
     ctx.run(refresh_pending)
+    refresh_active_users()
 
-    return pn.Column(
+    banner = make_impersonation_banner()
+    components: list[Any] = []
+    if banner:
+        components.append(banner)
+    components += [
         "## SaasCo Admin",
         pn.layout.Divider(),
         "### Create New Tenant",
@@ -559,7 +1099,9 @@ def create_tenantadmin_app():
         add_user_status,
         "#### Users Awaiting Login",
         pending_col,
+        "#### Active Users",
+        active_users_col,
         pn.layout.Divider(),
         pn.pane.Markdown("[Back to app](/panel) | [Log out](/auth/logout)"),
-        sizing_mode="stretch_width",
-    )
+    ]
+    return pn.Column(*components, sizing_mode="stretch_width")
