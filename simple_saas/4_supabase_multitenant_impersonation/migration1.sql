@@ -53,16 +53,6 @@ CREATE TABLE private.user_tenant_map (
 );
 ALTER TABLE private.user_tenant_map DISABLE ROW LEVEL SECURITY;
 
-CREATE TABLE IF NOT EXISTS private.auth_debug_log (
-  id         serial PRIMARY KEY,
-  func_name  text,
-  payload    jsonb,
-  created_at timestamptz DEFAULT now()
-);
-ALTER TABLE private.auth_debug_log DISABLE ROW LEVEL SECURITY;
-GRANT INSERT ON private.auth_debug_log TO supabase_auth_admin;
-GRANT USAGE ON SEQUENCE private.auth_debug_log_id_seq TO supabase_auth_admin;
-
 -- ============================================================
 -- ENABLE RLS
 -- ============================================================
@@ -140,19 +130,10 @@ DECLARE
   user_email text;
   allowed    boolean;
 BEGIN
---  insert into private.auth_debug_log (func_name, payload)
---  values ('hook_check_allowlist', event);
   user_email := event->'user'->>'email';
   IF user_email IS NULL THEN
     user_email := event->'user'->'user_metadata'->>'email';
   END IF;
-
---  insert into private.auth_debug_log (func_name, payload)
---    values ('hook_check_allowlist_extracted', jsonb_build_object(
---      'extracted_email', user_email,
---      'raw_user_meta_data', event->'raw_user_meta_data',
---      'top_level_email', event->>'email'
---    ));
 
   SELECT EXISTS(
     SELECT 1 FROM public.tenant_email_allowlist

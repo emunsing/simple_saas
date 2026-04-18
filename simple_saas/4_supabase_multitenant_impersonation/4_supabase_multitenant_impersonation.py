@@ -20,8 +20,13 @@ Optional: AUTH_REDIRECT_URL, SESSION_SECRET_KEY (openssl rand -hex 32).
 Apply migration1.sql then migration2_impersonation.sql in Supabase before running.
 """
 
+import hashlib
+import hmac as _hmac
 import logging
 import os
+import secrets
+import time
+from collections import defaultdict
 from contextvars import ContextVar, copy_context
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -49,6 +54,9 @@ SUPABASE_ANON_KEY = os.environ["SUPABASE_API_KEY"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 AUTH_REDIRECT_URL = os.environ.get("AUTH_REDIRECT_URL", "http://127.0.0.1:8000/auth/callback")
 SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", os.urandom(32).hex())
+# Secret used to HMAC-sign the x-impersonator-id header value.
+# Must also be set in PostgreSQL: ALTER DATABASE postgres SET app.impersonation_hmac_secret = '...';
+IMPERSONATION_HMAC_SECRET = os.environ.get("IMPERSONATION_HMAC_SECRET", "")
 if not os.environ.get("SESSION_SECRET_KEY"):
     logger.warning(
         "SESSION_SECRET_KEY not set; using a random value. Sessions will not persist across restarts."
@@ -56,6 +64,10 @@ if not os.environ.get("SESSION_SECRET_KEY"):
 if not SUPABASE_SERVICE_ROLE_KEY:
     logger.warning(
         "SUPABASE_SERVICE_ROLE_KEY not set; impersonation will not work."
+    )
+if not IMPERSONATION_HMAC_SECRET:
+    logger.warning(
+        "IMPERSONATION_HMAC_SECRET not set; impersonation audit headers will be rejected by the database."
     )
 
 # Request-scoped auth (set by middleware)
@@ -68,6 +80,8 @@ user_email_ctx: ContextVar[Optional[str]] = ContextVar("user_email", default=Non
 impersonated_user_ctx: ContextVar[Optional[dict]] = ContextVar("impersonated_user", default=None)
 # impersonator_id_ctx: the admin's user_id when impersonation is active; used to set x-impersonator-id header
 impersonator_id_ctx: ContextVar[Optional[str]] = ContextVar("impersonator_id", default=None)
+# csrf_token_ctx: per-session CSRF token used to authenticate impersonation/stop-impersonation links
+csrf_token_ctx: ContextVar[Optional[str]] = ContextVar("csrf_token", default=None)
 
 # Roles that can access /admin (tenant-level admin)
 TENANT_ADMIN_ROLES = {"saasco_superuser", "saasco_employee", "tenant_superuser", "tenant_admin"}
@@ -83,6 +97,78 @@ _IMPERSONATABLE_ROLES: dict[str, set[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Impersonation token cache
+# Stores impersonation JWTs in process memory keyed by session UUID.
+# The JWT never touches the database — only the audit metadata does.
+# Sessions are evicted on stop-impersonation or natural TTL expiry.
+# ---------------------------------------------------------------------------
+_impersonation_token_cache: dict[str, tuple[str, datetime]] = {}
+
+
+def _store_impersonation_token(session_id: str, token: str, expires_at: datetime) -> None:
+    _impersonation_token_cache[session_id] = (token, expires_at)
+
+
+def _fetch_impersonation_token(session_id: str) -> Optional[str]:
+    entry = _impersonation_token_cache.get(session_id)
+    if not entry:
+        return None
+    token, expires_at = entry
+    if datetime.now(timezone.utc) >= expires_at:
+        _impersonation_token_cache.pop(session_id, None)
+        return None
+    return token
+
+
+def _evict_impersonation_token(session_id: str) -> None:
+    _impersonation_token_cache.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Impersonation rate limiter
+# Keyed by admin user_id; limits impersonation attempts to prevent enumeration.
+# ---------------------------------------------------------------------------
+_impersonation_attempts: dict[str, list[float]] = defaultdict(list)
+_RATE_LIMIT_MAX = 10       # attempts allowed per window
+_RATE_LIMIT_WINDOW = 60.0  # seconds
+
+
+def _is_rate_limited(admin_user_id: str) -> bool:
+    """Return True (and log) if this admin has exceeded the impersonation rate limit."""
+    now = time.time()
+    cutoff = now - _RATE_LIMIT_WINDOW
+    recent = [t for t in _impersonation_attempts[admin_user_id] if t > cutoff]
+    _impersonation_attempts[admin_user_id] = recent
+    if len(recent) >= _RATE_LIMIT_MAX:
+        logger.warning(
+            "auth_impersonate: rate limit exceeded for admin_user_id=%s (%d attempts in %ds)",
+            admin_user_id, len(recent), int(_RATE_LIMIT_WINDOW),
+        )
+        return True
+    _impersonation_attempts[admin_user_id].append(now)
+    return False
+
+
+def _sign_impersonator_claim(impersonator_id: str) -> str:
+    """Return a signed value for the x-impersonator-id request header.
+
+    Format: <uuid>.<unix_timestamp>.<hmac_sha256_hex>
+
+    PostgreSQL's current_impersonator_id() verifies the HMAC and timestamp
+    before trusting the UUID, preventing external clients from forging
+    audit attribution by setting the header directly on Supabase REST calls.
+    """
+    if not IMPERSONATION_HMAC_SECRET:
+        raise RuntimeError(
+            "IMPERSONATION_HMAC_SECRET is not set. Cannot sign impersonator claim."
+        )
+    ts = str(int(time.time()))
+    msg = f"{impersonator_id}.{ts}".encode()
+    sig = _hmac.new(IMPERSONATION_HMAC_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+    return f"{impersonator_id}.{ts}.{sig}"
+
+
 def _supabase_auth_client() -> Client:
     """Client with PKCE flow for login."""
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY, ClientOptions(flow_type="pkce"))
@@ -94,16 +180,17 @@ def get_supabase_for_user(
 ) -> Client:
     """Supabase client with user JWT so RLS applies.
 
-    When impersonator_id is set, adds an x-impersonator-id request header.
-    PostgREST exposes this as request.headers in PostgreSQL, allowing audit
-    triggers to record both the effective user (auth.uid()) and the real actor.
+    When impersonator_id is set, attaches a signed x-impersonator-id header.
+    The value is HMAC-SHA256 signed (uuid.timestamp.sig) so PostgreSQL's
+    current_impersonator_id() can reject forgeries from external clients
+    before trusting the UUID for audit attribution.
     """
     opts = ClientOptions()
     headers: dict[str, str] = {}
     if access_token:
         headers["Authorization"] = f"Bearer {access_token}"
     if impersonator_id:
-        headers["x-impersonator-id"] = impersonator_id
+        headers["x-impersonator-id"] = _sign_impersonator_claim(impersonator_id)
     if headers:
         opts.headers = headers
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=opts)
@@ -128,6 +215,15 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
         email = request.session.get("email") if session else None
         impersonation = request.session.get("impersonation") if session else None
 
+        # Ensure every authenticated session has a CSRF token.
+        # Generated lazily here (rather than only in auth_callback) so that
+        # sessions created before this change also get a token on next request.
+        csrf_token = request.session.get("csrf_token") if session else None
+        if admin_token and not csrf_token:
+            csrf_token = secrets.token_urlsafe(32)
+            if session:
+                request.session["csrf_token"] = csrf_token
+
         # Auto-expire impersonation sessions whose token TTL has passed.
         # This prevents stale impersonation tokens from reaching Panel callbacks
         # when the admin returns to a tab after a long absence.
@@ -146,19 +242,20 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
                 except ValueError:
                     pass  # malformed date; leave impersonation intact
 
-        # Effective token: fetch from DB when impersonation is active (token not in cookie)
+        # Effective token: look up from in-memory cache when impersonation is active.
         effective_token: Optional[str] = admin_token
         if impersonation:
             session_id = impersonation.get("session_id")
             if session_id:
-                try:
-                    effective_token = _fetch_impersonation_token(session_id)
-                except Exception:
-                    logger.exception("middleware: failed to fetch impersonation token for session %s", session_id)
-                    effective_token = None
-            else:
-                # Legacy: token stored directly in cookie (should not occur after this deploy)
-                effective_token = impersonation.get("access_token")
+                effective_token = _fetch_impersonation_token(session_id)
+                if effective_token is None:
+                    # Cache miss — session expired or server restarted; clear cookie state.
+                    logger.info(
+                        "middleware: impersonation token not in cache for session %s; clearing",
+                        session_id,
+                    )
+                    request.session.pop("impersonation", None)
+                    impersonation = None
         impersonated_user = impersonation.get("user_info") if impersonation else None
         impersonator_id = impersonation.get("impersonator_id") if impersonation else None
 
@@ -167,6 +264,7 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
         e_ctx = user_email_ctx.set(email)
         i_ctx = impersonated_user_ctx.set(impersonated_user)
         imp_id_ctx = impersonator_id_ctx.set(impersonator_id)
+        c_ctx = csrf_token_ctx.set(csrf_token)
         try:
             return await call_next(request)
         finally:
@@ -175,6 +273,7 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
             user_email_ctx.reset(e_ctx)
             impersonated_user_ctx.reset(i_ctx)
             impersonator_id_ctx.reset(imp_id_ctx)
+            csrf_token_ctx.reset(c_ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +308,13 @@ async def auth_callback(request: Request, code: str | None = None):
     auth_resp = supabase.auth.exchange_code_for_session(
         {"auth_code": code, "code_verifier": code_verifier}
     )
-    assert auth_resp.user is not None and auth_resp.user.email is not None
+    if auth_resp.user is None or auth_resp.user.email is None:
+        logger.error("auth_callback: OAuth response missing user or email")
+        return RedirectResponse("/auth/login", status_code=302)
     request.session["email"] = auth_resp.user.email
     request.session["access_token"] = auth_resp.session.access_token
     request.session["refresh_token"] = auth_resp.session.refresh_token
+    request.session["csrf_token"] = secrets.token_urlsafe(32)
     return RedirectResponse("/panel", status_code=302)
 
 
@@ -223,12 +325,28 @@ async def auth_logout(request: Request):
 
 
 @app.get("/auth/impersonate/{user_id}")
-async def auth_impersonate(request: Request, user_id: str, reason: str = ""):
+async def auth_impersonate(request: Request, user_id: str, reason: str = "", csrf_token: str = ""):
     """Start impersonating a user. Validates permissions, generates a session token
-    for the target user via magic link, then stores it in the session cookie."""
+    for the target user via magic link, then stores it in the session cookie.
+
+    # TODO(security): Enforce a minimum non-empty reason string for SOC-2 audit trails.
+    #   The DB column is NOT NULL DEFAULT '' — change to NOT NULL with a CHECK (length > 0)
+    #   and add a confirmation UI step that collects a business justification.
+    # TODO(security): Require MFA / step-up authentication before impersonation is permitted.
+    #   The current flow requires only a valid session cookie. For production, require a
+    #   TOTP challenge or re-authentication before this endpoint is reachable.
+    # TODO(compliance): Notify the affected tenant when one of their users is impersonated.
+    #   Options: email to tenant_superuser, in-app notification on next login, webhook.
+    """
     admin_token = request.session.get("access_token")
     if not admin_token:
         return RedirectResponse("/auth/login")
+
+    # CSRF check: token in query param must match the session token.
+    stored_csrf = request.session.get("csrf_token", "")
+    if not stored_csrf or not secrets.compare_digest(csrf_token, stored_csrf):
+        logger.warning("auth_impersonate: CSRF token mismatch for user_id=%s", user_id)
+        return RedirectResponse("/panel")
 
     # Prevent nested impersonation
     if request.session.get("impersonation"):
@@ -245,6 +363,9 @@ async def auth_impersonate(request: Request, user_id: str, reason: str = ""):
         return RedirectResponse("/panel")
 
     if not admin_info or admin_info.get("role") not in TENANT_ADMIN_ROLES:
+        return RedirectResponse("/panel")
+
+    if _is_rate_limited(admin_info["user_id"]):
         return RedirectResponse("/panel")
 
     # Look up target user via service role (admin may be in a different tenant)
@@ -275,29 +396,22 @@ async def auth_impersonate(request: Request, user_id: str, reason: str = ""):
         logger.exception("auth_impersonate: failed to generate impersonation token")
         return RedirectResponse("/panel")
 
-    # Record audit row and store the token server-side; return the row UUID.
-    # The JWT (~1.4 KB) is NOT stored in the cookie — only the UUID reference
-    # is, keeping the session well under the 4096-byte cookie limit.
+    # Insert audit row (no JWT stored in DB); cache the token in process memory.
+    expires_at_dt = datetime.now(timezone.utc) + timedelta(hours=1)
     try:
-        session_id = _record_impersonation_session(
-            admin_info, target_info, reason, impersonation_token
-        )
+        session_id = _record_impersonation_session(admin_info, target_info, reason)
     except Exception:
         logger.exception("auth_impersonate: failed to record audit log")
         return RedirectResponse("/panel")
 
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _store_impersonation_token(session_id, impersonation_token, expires_at_dt)
+
     request.session["impersonation"] = {
         "session_id": session_id,
         "user_info": target_info,
         "impersonator_id": admin_info["user_id"],
-        "expires_at": expires_at,
+        "expires_at": expires_at_dt.isoformat(),
     }
-    logger.info(
-        "IMPERSONATION DEBUG session keys=%s session_id=%s",
-        list(request.session.keys()),
-        session_id,
-    )
     logger.info(
         "Impersonation started: %s -> %s",
         admin_info.get("user_email", admin_info["user_id"]),
@@ -307,25 +421,33 @@ async def auth_impersonate(request: Request, user_id: str, reason: str = ""):
 
 
 @app.get("/auth/stop-impersonation")
-async def auth_stop_impersonation(request: Request):
+async def auth_stop_impersonation(request: Request, csrf_token: str = ""):
     """End impersonation and return to admin's normal session."""
+    stored_csrf = request.session.get("csrf_token", "")
+    if not stored_csrf or not secrets.compare_digest(csrf_token, stored_csrf):
+        logger.warning("auth_stop_impersonation: CSRF token mismatch")
+        return RedirectResponse("/panel")
+
     impersonation = request.session.pop("impersonation", None)
     if impersonation:
+        session_id = impersonation.get("session_id")
+        if session_id:
+            # Revoke the impersonation JWT at Supabase (scope="local" revokes only
+            # this session, not any real sessions the target user may have open).
+            token = _fetch_impersonation_token(session_id)
+            if token:
+                try:
+                    get_supabase_admin().auth.admin.sign_out(token, scope="local")
+                except Exception:
+                    logger.exception("stop_impersonation: failed to revoke impersonation JWT (non-fatal)")
+            _evict_impersonation_token(session_id)
         # Mark session as ended in the audit log
         try:
             supabase_admin = get_supabase_admin()
-            session_id = impersonation.get("session_id")
             if session_id:
                 supabase_admin.table("impersonation_sessions").update(
                     {"ended_at": datetime.now(timezone.utc).isoformat()}
                 ).eq("id", session_id).execute()
-            else:
-                # Legacy fallback
-                supabase_admin.table("impersonation_sessions").update(
-                    {"ended_at": datetime.now(timezone.utc).isoformat()}
-                ).eq("impersonator_id", impersonation["impersonator_id"]).eq(
-                    "target_user_id", impersonation["user_info"]["user_id"]
-                ).is_("ended_at", "null").execute()
         except Exception:
             logger.exception("stop_impersonation: failed to update audit log (non-fatal)")
 
@@ -415,19 +537,21 @@ def can_impersonate(admin_info: dict, target_info: dict) -> bool:
 def _generate_impersonation_token(target_email: str) -> str:
     """Use the admin API to mint a magic-link OTP, then exchange it for a real
     access token for the target user.  The resulting JWT has auth.uid() ==
-    target user's UUID, so all existing RLS policies work unchanged."""
-    print("Getting supabase admin session")
-    supabase_admin = get_supabase_admin()
+    target user's UUID, so all existing RLS policies work unchanged.
 
-    print("Generating link")
+    Note on email delivery: the admin generate_link API returns the token directly
+    and does NOT send an email to the target user by default.  Supabase only sends
+    email when the client-facing sign_in_with_otp() call is used.  If your project
+    has a custom SMTP hook that intercepts all OTP events, verify that it does not
+    forward admin-generated links.
+    """
+    supabase_admin = get_supabase_admin()
     link_resp = supabase_admin.auth.admin.generate_link(
         {"type": "magiclink", "email": target_email}
     )
     hashed_token = link_resp.properties.hashed_token
-    print(f"Got hashed token {hashed_token}")
 
     anon_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    print("Client created")
     # hashed_token from generate_link is already the stored hash.
     # Pass it as token_hash (not token) so GoTrue looks it up directly
     # rather than hashing it again.  Type must be "email" — that is how
@@ -435,13 +559,6 @@ def _generate_impersonation_token(target_email: str) -> str:
     # requested via generate_link.
     otp_resp = anon_client.auth.verify_otp(
         {"token_hash": hashed_token, "type": "email"}
-    )
-    # Checkpoint 1: did verify_otp return a session at all?
-    logger.info(
-        "IMPERSONATION DEBUG verify_otp: user=%s session_present=%s token_present=%s",
-        getattr(getattr(otp_resp, "user", None), "email", None),
-        otp_resp.session is not None,
-        bool(getattr(otp_resp.session, "access_token", None)) if otp_resp.session else False,
     )
     if otp_resp.session is None:
         raise RuntimeError(
@@ -452,9 +569,13 @@ def _generate_impersonation_token(target_email: str) -> str:
 
 
 def _record_impersonation_session(
-    admin_info: dict, target_info: dict, reason: str, access_token: str
+    admin_info: dict, target_info: dict, reason: str
 ) -> str:
-    """Insert an audit row and return the new session UUID."""
+    """Insert an audit row and return the new session UUID.
+
+    The impersonation JWT is NOT stored in the database — it lives only in
+    _impersonation_token_cache for the lifetime of this server process.
+    """
     supabase_admin = get_supabase_admin()
     r = supabase_admin.table("impersonation_sessions").insert(
         {
@@ -463,23 +584,9 @@ def _record_impersonation_session(
             "target_email": target_info["user_email"],
             "target_tenant_id": target_info["tenant_id"],
             "reason": reason,
-            "access_token": access_token,
         }
     ).execute()
     return r.data[0]["id"]
-
-
-def _fetch_impersonation_token(session_id: str) -> Optional[str]:
-    """Look up the impersonation JWT from the DB by session UUID."""
-    supabase_admin = get_supabase_admin()
-    r = (
-        supabase_admin.table("impersonation_sessions")
-        .select("access_token")
-        .eq("id", session_id)
-        .single()
-        .execute()
-    )
-    return (r.data or {}).get("access_token")
 
 
 # ---------------------------------------------------------------------------
@@ -662,9 +769,10 @@ def make_impersonation_banner() -> Optional[pn.viewable.Viewable]:
         return None
     email = impersonated.get("user_email", "unknown")
     role = impersonated.get("role", "")
+    csrf = csrf_token_ctx.get() or ""
     return pn.pane.Markdown(
         f"**Impersonation active** — viewing as **{email}** (`{role}`) "
-        f"&nbsp;&nbsp;[Stop impersonation](/auth/stop-impersonation)",
+        f"&nbsp;&nbsp;[Stop impersonation](/auth/stop-impersonation?csrf_token={csrf})",
         styles={
             "background-color": "#fff3cd",
             "border": "1px solid #ffc107",
@@ -745,6 +853,7 @@ def make_active_users_panel(
     if not users:
         return pn.Column(pn.pane.Markdown("_No active users found._"))
 
+    csrf = csrf_token_ctx.get() or ""
     rows = []
     for u in users:
         uid = u["user_id"]
@@ -758,7 +867,9 @@ def make_active_users_panel(
             identity += f" · _{tenant_name}_"
 
         if can_impersonate(admin_info, u):
-            action = pn.pane.Markdown(f"[Impersonate](/auth/impersonate/{uid})", width=150)
+            action = pn.pane.Markdown(
+                f"[Impersonate](/auth/impersonate/{uid}?csrf_token={csrf})", width=150
+            )
         else:
             action = pn.pane.Markdown("_(self or higher role)_", width=150)
 
@@ -776,13 +887,6 @@ def create_panel_app():
     # initialises this Panel session.  Button-click callbacks run via
     # Bokeh/Tornado's IO loop in a different context, so we restore the
     # snapshot with ctx.run() on every callback that touches Supabase.
-
-    # Checkpoint 4: confirm what the Panel factory sees when it initialises
-    logger.info(
-        "IMPERSONATION DEBUG panel_factory: access_token_present=%s impersonated_user=%s",
-        bool(access_token_ctx.get()),
-        (impersonated_user_ctx.get() or {}).get("user_email", "none"),
-    )
 
     ctx = copy_context()
 
@@ -868,12 +972,10 @@ def create_panel_app():
 def create_admin_app():
     ctx = copy_context()
 
-    print("Checking for admin token from /admin request...")
     if not _admin_token():
         return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
 
     # Always use admin's real info for access control, even during impersonation
-    print("Get_admin_user_info from /admin request...")
     user_info = get_admin_user_info()
     if not user_info or user_info.get("role") not in TENANT_ADMIN_ROLES:
         return pn.Column(
@@ -902,19 +1004,13 @@ def create_admin_app():
     pending_col = pn.Column()
     active_users_col = pn.Column()
 
-    print("Function definitions in /admin request...")
     def refresh_pending(*_):
-        print("Calling refresh_pending...")
         pending_col.objects = [make_pending_users_panel(tenant_id, refresh_pending, ctx)]
-        print("Done calling refresh_pending.")
 
     def refresh_active_users(*_):
-        print("Calling refresh_active_users...")
         def _inner():
-            print("Calling _inner of refresh_active_users...")
             active_users_col.objects = [make_active_users_panel(user_info, tenant_id=tenant_id)]
         ctx.run(_inner)
-        print("Done calling refresh_active_users.")
 
     def on_add(event=None):
         def _inner():
@@ -940,7 +1036,6 @@ def create_admin_app():
     ctx.run(refresh_pending)
     refresh_active_users()  # already calls ctx.run(_inner) internally; must not be double-wrapped
 
-    print("About to make impersonation banner")
     banner = make_impersonation_banner()
     components: list[Any] = []
     if banner:
@@ -969,7 +1064,6 @@ def create_admin_app():
 def create_tenantadmin_app():
     ctx = copy_context()
 
-    print("Checking for admin token from /tenantadmin request...")
     if not _admin_token():
         return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
 
