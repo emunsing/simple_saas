@@ -748,6 +748,156 @@ def admin_list_allowlist(tenant_id: Optional[str] = None) -> list[dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
+# Data helpers: projects
+# All use the effective token so they work correctly during impersonation.
+# ---------------------------------------------------------------------------
+
+def list_accessible_projects() -> list[dict[str, Any]]:
+    """Projects the effective user created OR that have been shared with them.
+
+    RLS provides tenant isolation; this function enforces the ReBAC layer:
+    only return rows where the user is the creator or holds a project_role.
+    """
+    user_info = get_current_user_info()
+    if not user_info:
+        return []
+    user_id = user_info["user_id"]
+    supabase = _get_supabase_effective()
+
+    owned_resp = (
+        supabase.table("projects")
+        .select("id, name, created_by, tenant_id, created_at")
+        .eq("created_by", user_id)
+        .execute()
+    )
+    owned = owned_resp.data or []
+    owned_ids = {p["id"] for p in owned}
+
+    roles_resp = (
+        supabase.table("project_roles")
+        .select("project_id")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    shared_ids = [
+        r["project_id"]
+        for r in (roles_resp.data or [])
+        if r["project_id"] not in owned_ids
+    ]
+
+    shared: list[dict] = []
+    if shared_ids:
+        shared_resp = (
+            supabase.table("projects")
+            .select("id, name, created_by, tenant_id, created_at")
+            .in_("id", shared_ids)
+            .execute()
+        )
+        shared = shared_resp.data or []
+
+    all_projects = owned + shared
+    all_projects.sort(key=lambda p: p.get("created_at", ""))
+    return all_projects
+
+
+def create_project(name: str) -> str:
+    """Create a project owned by the effective user. Returns the new project id."""
+    user_info = get_current_user_info()
+    if not user_info:
+        raise PermissionError("Not authenticated")
+    supabase = _get_supabase_effective()
+    r = supabase.table("projects").insert({
+        "name": name,
+        "tenant_id": user_info["tenant_id"],
+        "created_by": user_info["user_id"],
+    }).execute()
+    return r.data[0]["id"]
+
+
+def delete_project(project_id: str) -> None:
+    """Delete a project. RLS enforces creator-only deletion."""
+    supabase = _get_supabase_effective()
+    supabase.table("projects").delete().eq("id", project_id).execute()
+
+
+def share_project(project_id: str, target_user_id: str) -> None:
+    """Share a project with another user. RLS enforces owner-only sharing.
+    Safe to call multiple times (upsert semantics)."""
+    user_info = get_current_user_info()
+    if not user_info:
+        raise PermissionError("Not authenticated")
+    supabase = _get_supabase_effective()
+    supabase.table("project_roles").upsert({
+        "project_id": project_id,
+        "user_id": target_user_id,
+        "granted_by": user_info["user_id"],
+    }).execute()
+
+
+def get_project_access_list(project_id: str) -> list[dict[str, Any]]:
+    """Return all users who can access a project, owner first.
+
+    Each entry: {username, user_email, access_type, granted_by_username, granted_at}
+    """
+    supabase = _get_supabase_effective()
+
+    proj_resp = (
+        supabase.table("projects")
+        .select("created_by, created_at")
+        .eq("id", project_id)
+        .single()
+        .execute()
+    )
+    if not proj_resp.data:
+        return []
+    creator_id: str = proj_resp.data["created_by"]
+
+    roles_resp = (
+        supabase.table("project_roles")
+        .select("user_id, granted_by, granted_at")
+        .eq("project_id", project_id)
+        .execute()
+    )
+    roles = roles_resp.data or []
+
+    # Fetch all involved users in a single query
+    all_ids = list(
+        {creator_id}
+        | {r["user_id"] for r in roles}
+        | {r["granted_by"] for r in roles}
+    )
+    users_resp = (
+        supabase.table("users")
+        .select("user_id, username, user_email")
+        .in_("user_id", all_ids)
+        .execute()
+    )
+    by_id: dict[str, dict] = {u["user_id"]: u for u in (users_resp.data or [])}
+
+    def _u(uid: str) -> dict:
+        return by_id.get(uid, {"username": "unknown", "user_email": "—"})
+
+    result = [
+        {
+            "username": _u(creator_id)["username"],
+            "user_email": _u(creator_id)["user_email"],
+            "access_type": "owner",
+            "granted_by_username": None,
+            "granted_at": proj_resp.data["created_at"],
+        }
+    ]
+    for role in sorted(roles, key=lambda r: r.get("granted_at", "")):
+        result.append({
+            "username": _u(role["user_id"])["username"],
+            "user_email": _u(role["user_id"])["user_email"],
+            "access_type": "shared",
+            "granted_by_username": _u(role["granted_by"])["username"],
+            "granted_at": role.get("granted_at", ""),
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
 # REST API
 # ---------------------------------------------------------------------------
 @app.get("/api/users/org")
@@ -895,6 +1045,7 @@ def create_panel_app():
     main_md = pn.pane.Markdown("", sizing_mode="stretch_width")
     refresh_btn = pn.widgets.Button(name="Refresh members", button_type="primary")
     logout_md = pn.pane.Markdown("[Log out](/auth/logout)")
+    projects_md = pn.pane.Markdown("[Projects](/projects)")
     tenant_admin_md = pn.pane.Markdown("[Tenant Admin](/tenantadmin)")
     user_admin_md = pn.pane.Markdown("[User Admin](/admin)")
 
@@ -903,6 +1054,7 @@ def create_panel_app():
             main_md.object = "[Log in with Google](/auth/login)"
             refresh_btn.visible = False
             logout_md.visible = False
+            projects_md.visible = False
             tenant_admin_md.visible = False
             user_admin_md.visible = False
             return
@@ -915,6 +1067,7 @@ def create_panel_app():
 
         refresh_btn.visible = True
         logout_md.visible = True
+        projects_md.visible = True
 
         impersonated = impersonated_user_ctx.get()
         display_email = impersonated["user_email"] if impersonated else (user_email_ctx.get() or "—")
@@ -959,7 +1112,7 @@ def create_panel_app():
         components.append(banner)
     components += [
         main_md,
-        pn.Row(tenant_admin_md, user_admin_md),
+        pn.Row(projects_md, tenant_admin_md, user_admin_md),
         pn.Row(refresh_btn, logout_md),
     ]
     return pn.Column(*components, sizing_mode="stretch_width")
@@ -1195,6 +1348,193 @@ def create_tenantadmin_app():
         pending_col,
         "#### Active Users",
         active_users_col,
+        pn.layout.Divider(),
+        pn.pane.Markdown("[Back to app](/panel) | [Log out](/auth/logout)"),
+    ]
+    return pn.Column(*components, sizing_mode="stretch_width")
+
+
+# ---------------------------------------------------------------------------
+# Panel app: /projects — ReBAC project list (all authenticated users)
+# ---------------------------------------------------------------------------
+@add_application("/projects", app=app, title="Projects")
+def create_projects_app():
+    ctx = copy_context()
+
+    if not _token():
+        return pn.Column(pn.pane.Markdown("[Log in with Google](/auth/login)"))
+
+    new_name_input = pn.widgets.TextInput(
+        name="Project name", placeholder="My Project", width=300
+    )
+    create_btn = pn.widgets.Button(name="Create Project", button_type="success")
+    create_status = pn.pane.Markdown("")
+    projects_col = pn.Column()
+
+    def refresh_projects(*_):
+        def _inner():
+            user_info = get_current_user_info()
+            if not user_info:
+                projects_col.objects = [pn.pane.Markdown("_Not authenticated._")]
+                return
+            my_user_id = user_info["user_id"]
+
+            try:
+                projects = list_accessible_projects()
+                org_users = list_org_users()
+            except Exception as e:
+                logger.exception("refresh_projects")
+                projects_col.objects = [pn.pane.Markdown(f"_Error loading projects: {e}_")]
+                return
+
+            # Org members excluding self, for the share dropdown
+            share_options: dict[str, str] = {
+                u["username"]: u["user_id"]
+                for u in org_users
+                if u["user_id"] != my_user_id
+            }
+
+            if not projects:
+                projects_col.objects = [pn.pane.Markdown("_No projects yet. Create one above._")]
+                return
+
+            blocks: list[Any] = []
+            for proj in projects:
+                pid = proj["id"]
+                is_owner = proj["created_by"] == my_user_id
+                label = f"**{proj['name']}**" + (" _(owner)_" if is_owner else " _(shared)_")
+
+                # --- share widget ---
+                if share_options:
+                    share_select = pn.widgets.Select(
+                        name="", options=share_options, width=200
+                    )
+                    share_btn = pn.widgets.Button(
+                        name="Share", button_type="primary", width=80,
+                        disabled=not is_owner,
+                        description="" if is_owner else "Only the project owner can share",
+                    )
+
+                    def _on_share(event, _pid=pid, _sel=share_select):
+                        def _inner_share():
+                            try:
+                                share_project(_pid, _sel.value)
+                            except Exception:
+                                logger.exception("share_project pid=%s", _pid)
+                        ctx.run(_inner_share)
+                        refresh_projects()
+
+                    share_btn.on_click(_on_share)
+                    share_widget: Any = pn.Row(share_select, share_btn)
+                else:
+                    share_widget = pn.pane.Markdown("_No other users in org_", width=260)
+
+                # --- detail pane (lazy-loaded, initially hidden) ---
+                detail_pane = pn.Column(visible=False)
+                details_btn = pn.widgets.Button(name="Details ▼", width=90)
+
+                def _on_details(event, _pid=pid, _proj=proj, _dp=detail_pane, _btn=details_btn):
+                    def _inner_details():
+                        if _dp.visible:
+                            _dp.visible = False
+                            _btn.name = "Details ▼"
+                            return
+                        try:
+                            access = get_project_access_list(_pid)
+                        except Exception:
+                            logger.exception("get_project_access_list pid=%s", _pid)
+                            _dp.objects = [pn.pane.Markdown("_Error loading details._")]
+                            _dp.visible = True
+                            _btn.name = "Details ▲"
+                            return
+
+                        created_at = (_proj.get("created_at") or "")[:19]
+                        lines = [
+                            f"**ID:** `{_pid}`",
+                            f"**Tenant ID:** `{_proj.get('tenant_id', '—')}`",
+                            f"**Created:** {created_at}",
+                            "",
+                            "**Users with access:**",
+                        ]
+                        for entry in access:
+                            uname = entry["username"]
+                            email = entry["user_email"]
+                            atype = entry["access_type"]
+                            gat = (entry["granted_at"] or "")[:19]
+                            if atype == "owner":
+                                lines.append(f"- **{uname}** ({email}) — _owner_")
+                            else:
+                                lines.append(
+                                    f"- **{uname}** ({email}) — "
+                                    f"_shared by {entry['granted_by_username']} on {gat}_"
+                                )
+                        _dp.objects = [pn.pane.Markdown("\n".join(lines))]
+                        _dp.visible = True
+                        _btn.name = "Details ▲"
+                    ctx.run(_inner_details)
+
+                details_btn.on_click(_on_details)
+
+                # --- assemble row ---
+                row_items: list[Any] = [
+                    pn.pane.Markdown(label, width=220),
+                    share_widget,
+                    details_btn,
+                ]
+
+                if is_owner:
+                    delete_btn = pn.widgets.Button(
+                        name="Delete", button_type="danger", width=80
+                    )
+
+                    def _on_delete(event, _pid=pid):
+                        def _inner_del():
+                            try:
+                                delete_project(_pid)
+                            except Exception:
+                                logger.exception("delete_project pid=%s", _pid)
+                        ctx.run(_inner_del)
+                        refresh_projects()
+
+                    delete_btn.on_click(_on_delete)
+                    row_items.append(delete_btn)
+
+                blocks.append(pn.Column(pn.Row(*row_items), detail_pane))
+
+            projects_col.objects = blocks
+        ctx.run(_inner)
+
+    def on_create(event=None):
+        def _inner():
+            name = new_name_input.value.strip()
+            if not name:
+                create_status.object = "_Please enter a project name._"
+                return
+            try:
+                create_project(name)
+                create_status.object = f"Created project **{name}**."
+                new_name_input.value = ""
+            except Exception as e:
+                logger.exception("create_project")
+                create_status.object = f"_Error: {e}_"
+        ctx.run(_inner)
+        refresh_projects()
+
+    create_btn.on_click(on_create)
+    refresh_projects()
+
+    banner = make_impersonation_banner()
+    components: list[Any] = []
+    if banner:
+        components.append(banner)
+    components += [
+        "## Projects",
+        "### Create New Project",
+        pn.Row(new_name_input, create_btn),
+        create_status,
+        pn.layout.Divider(),
+        "### Your Projects",
+        projects_col,
         pn.layout.Divider(),
         pn.pane.Markdown("[Back to app](/panel) | [Log out](/auth/logout)"),
     ]
