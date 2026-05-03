@@ -17,15 +17,23 @@ The core idea builds off of the [webscenarios]() repository, specifically
 which demonstrates a simple relationship-based access control system with users and shared projects, but which doesn't 
 attempt to implement authentication or multi-tenant support.
 
-The uvicorn+panel demos can be run like `python <scriptname>.py` or `uvicorn <scriptname>:app --reload --port 8000`
-- IMPORTANT: See the below note about websocket gotchas when running Panel with Uvicorn
-- These require a postgres server to be running, and if the default Postgres URL isn't used, the URL should be overriden with the environment variable `DATABASE_URL`.
-
 The demos go in the following order:
 - `0_supabase_simple_oauth.py`: Basic PKCE OAuth with Supabase client
 - `1_supabase_panel_simple_oauth.py`: Similar to the above, but using Panel instead of raw HTML to ensure that your Panel + Uvicorn setup is working.
 - `2_supabase_multitenant_users`: Given pre-populated entries in the database, demonstrate we can do multi-tenant user authentication.
-- `3_supabase_multitenant_admin`: Add admin roles and views for user administration.  
+- `3_supabase_multitenant_admin`: Add admin roles and views for user administration.
+
+# Running Demos:
+
+```
+# starting in repo root directory
+cd simple_saas
+uvicorn <folder_name>.<script_name>:app --reload --port 8000
+```
+
+The uvicorn+panel demos can be run like `python <scriptname>.py` or `uvicorn <scriptname>:app --reload --port 8000`
+- IMPORTANT: See the below note about websocket gotchas when running Panel with Uvicorn
+- These require a postgres server to be running, and if the default Postgres URL isn't used, the URL should be overriden with the environment variable `DATABASE_URL`.
 
 # Specific requirements
 

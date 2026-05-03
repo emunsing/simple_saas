@@ -318,7 +318,7 @@ CREATE POLICY "allowlist_insert_admin"
     (SELECT public.current_user_role()) = 'saasco_superuser'
     OR (
       (SELECT public.current_user_role()) = 'saasco_employee'
-      AND role != 'saasco_superuser'
+      AND role IN ('tenant_superuser', 'tenant_admin', 'user')
     )
     OR (
       (SELECT public.current_user_role()) = 'tenant_superuser'

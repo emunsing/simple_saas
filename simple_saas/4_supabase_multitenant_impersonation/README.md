@@ -87,8 +87,28 @@ The Supabase admin `generate_link` API returns the token directly without sendin
 by default. If your project uses a custom SMTP hook, verify that it does not forward
 admin-generated magic links to end users.
 
+**Magic-link session creates a real session**
+- `_generate_impersonation_token()` calls `generate_link` + `verify_otp`, which creates
+a real session in `auth.sessions` for the target user. This means:
+- The target user may see an unexpected active session in any "active sessions" UI.
+- If Supabase sends session-creation webhooks, downstream systems will see a phantom login.
+- The `admin.sign_out(scope="local")` revocation on stop-impersonation depends on the
+  server staying up. An unclean shutdown leaves orphaned sessions.
+
+**Audit log retention policy**
+SOC-2 requires that audit logs be tamper-resistant and retained for a defined period.
+**Fix (retention):** Add a `pg_cron` job or application-level process to archive rows 
+older than your retention window (typically 1-3 years for SOC-2) to cold storage.
+
 **Multi-process / multi-instance deployments**
 The in-memory token cache is per-process. In a multi-worker or horizontally scaled
 deployment, impersonation sessions started on one instance will not be visible to others.
 Migrate the cache to Redis (with TTL matching the 1-hour session window) before deploying
 behind a load balancer.
+
+**Rate limiter does not survive restarts or scale horizontally**
+The in-memory `_impersonation_attempts` dict resets on process restart, and each
+worker/instance maintains its own counter. An attacker can reset the rate limit by
+waiting for a deploy, or distribute attempts across instances behind a load balancer.
+- **Fix:** Move to Redis-backed rate limiting (or use a Supabase RPC that checks
+  `impersonation_sessions` row count in the last N seconds) before multi-process deploy.
