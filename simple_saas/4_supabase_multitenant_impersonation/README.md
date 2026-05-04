@@ -112,3 +112,56 @@ worker/instance maintains its own counter. An attacker can reset the rate limit 
 waiting for a deploy, or distribute attempts across instances behind a load balancer.
 - **Fix:** Move to Redis-backed rate limiting (or use a Supabase RPC that checks
   `impersonation_sessions` row count in the last N seconds) before multi-process deploy.
+
+# Test Plan
+
+Non-whitelisted users should not be able to log in
+
+Basic operations, should be tested for all user types:
+- Log in
+- See users in your organization on the landing page
+- *Don't* see users from other organization
+- See your projects listed
+- See projects which have been shared with you
+- *Don't* see projects from other organization
+- *Don't* see projects which haven't been shared with you
+- Create a project
+- Share a project with a user in your organization
+- Log out
+
+Admin operations:
+- Can create usertype
+- Can see user in user list
+- Can see user in impersonation user list
+- Can impersonate usertype
+- While impersonating, can perform all basic operations
+- Can stop impersonation and return to admin session
+
+SaasCo superuser:
+- Can see all users from all tenants
+- Can perform all "basic operations"
+- For each usertype in ("saasco_employee", "tenant_superuser", "tenant_admin", "user"):
+  - Can perform all admin operations on that usertype, including performing all the basic operations while impersonating the user
+
+SaasCo Employee:
+- Can see all users from all tenants
+- Can perform all "basic operations"
+- For each usertype in ("tenant_superuser", "tenant_admin", "user"):
+  - Can perform all admin operations on that usertype, including performing all the basic operations while impersonating the user
+
+Tenant Superuser:
+- Can see all users for their tenant
+- Can perform all "basic operations"
+- *Cannot* see users from other tenants
+- For each usertype in ("tenant_admin", "user"):
+  - Can perform all admin operations on that usertype, including performing all the basic operations while impersonating the user
+
+Tenant Admin:
+- Can see all users for their tenant
+- Can perform all "basic operations"
+- *Cannot* see users from other tenants
+- For "user" role
+  - Can perform all Admin operations for the "user" role, *except* creating new users.
+
+Tenant user:
+- Can perform all basic operations
