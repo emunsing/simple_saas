@@ -63,57 +63,9 @@ SESSION_SECRET_KEY=...          # openssl rand -hex 32
 - **Audit triggers** on `public.tenants`, `public.users`, `public.tenant_email_allowlist`,
   and `public.impersonation_sessions` — including the audit log itself.
 
-### Known limitations (TODOs for production hardening)
-
-**Reason enforcement (SOC-2 CC7)**
-The `reason` field is accepted but not enforced to be non-empty. For production:
-- Add `CHECK (length(reason) > 0)` to the `impersonation_sessions` table.
-- Add a confirmation UI step that collects a documented business justification
-  before the impersonation link is generated.
-
-**Step-up authentication (SOC-2 CC6.3)**
-A valid session cookie is currently sufficient to initiate impersonation. For production:
-- Require a TOTP challenge or re-authentication immediately before the impersonation
-  endpoint is reachable.
-- Consider integrating with Supabase MFA (`supabase.auth.mfa`).
-
-**Tenant notification (SOC-2 CC9)**
-Customers are not notified when SaasCo staff impersonates one of their users. For production:
-- Send an email to the `tenant_superuser` on each impersonation start.
-- Optionally expose an impersonation log view to tenant admins in the tenant admin panel.
-
-**Magic-link email delivery**
-The Supabase admin `generate_link` API returns the token directly without sending an email
-by default. If your project uses a custom SMTP hook, verify that it does not forward
-admin-generated magic links to end users.
-
-**Magic-link session creates a real session**
-- `_generate_impersonation_token()` calls `generate_link` + `verify_otp`, which creates
-a real session in `auth.sessions` for the target user. This means:
-- The target user may see an unexpected active session in any "active sessions" UI.
-- If Supabase sends session-creation webhooks, downstream systems will see a phantom login.
-- The `admin.sign_out(scope="local")` revocation on stop-impersonation depends on the
-  server staying up. An unclean shutdown leaves orphaned sessions.
-
-**Audit log retention policy**
-SOC-2 requires that audit logs be tamper-resistant and retained for a defined period.
-**Fix (retention):** Add a `pg_cron` job or application-level process to archive rows 
-older than your retention window (typically 1-3 years for SOC-2) to cold storage.
-
-**Multi-process / multi-instance deployments**
-The in-memory token cache is per-process. In a multi-worker or horizontally scaled
-deployment, impersonation sessions started on one instance will not be visible to others.
-Migrate the cache to Redis (with TTL matching the 1-hour session window) before deploying
-behind a load balancer.
-
-**Rate limiter does not survive restarts or scale horizontally**
-The in-memory `_impersonation_attempts` dict resets on process restart, and each
-worker/instance maintains its own counter. An attacker can reset the rate limit by
-waiting for a deploy, or distribute attempts across instances behind a load balancer.
-- **Fix:** Move to Redis-backed rate limiting (or use a Supabase RPC that checks
-  `impersonation_sessions` row count in the last N seconds) before multi-process deploy.
 
 # Test Plan
+The below steps constitute our test plan for validating the functionality:
 
 Non-whitelisted users should not be able to log in
 
@@ -165,3 +117,56 @@ Tenant Admin:
 
 Tenant user:
 - Can perform all basic operations
+
+
+# Known limitations (TODOs for production hardening)
+
+**Reason enforcement (SOC-2 CC7)**
+The `reason` field is accepted but not enforced to be non-empty. For production:
+- Add `CHECK (length(reason) > 0)` to the `impersonation_sessions` table.
+- Add a confirmation UI step that collects a documented business justification
+  before the impersonation link is generated.
+
+**Step-up authentication (SOC-2 CC6.3)**
+A valid session cookie is currently sufficient to initiate impersonation. For production:
+- Require a TOTP challenge or re-authentication immediately before the impersonation
+  endpoint is reachable.
+- Consider integrating with Supabase MFA (`supabase.auth.mfa`).
+
+**Tenant notification (SOC-2 CC9)**
+Customers are not notified when impersonation begins. For production:
+- Send an email to the `tenant_superuser` on each impersonation start.
+- Optionally expose an impersonation log view to tenant admins in the tenant admin panel.
+
+**Magic-link email delivery**
+The Supabase admin `generate_link` API returns the token directly without sending an email
+by default. If your project uses a custom SMTP hook, verify that it does not forward
+admin-generated magic links to end users.
+
+**Magic-link session creates a real session**
+- `_generate_impersonation_token()` calls `generate_link` + `verify_otp`, which creates
+a real session in `auth.sessions` for the target user. This means:
+- The target user may see an unexpected active session in any "active sessions" UI.
+- If Supabase sends session-creation webhooks, downstream systems will see a phantom login.
+- The `admin.sign_out(scope="local")` revocation on stop-impersonation depends on the
+  server staying up. An unclean shutdown leaves orphaned sessions.
+- This can be particularly concerning for horizontal scaling.
+- Improvement: Store session_id in DB, and check session_id via Postgres header
+
+**Audit log retention policy**
+SOC-2 requires that audit logs be tamper-resistant and retained for a defined period.
+**Fix (retention):** Add a `pg_cron` job or application-level process to archive rows 
+older than your retention window (typically 1-3 years for SOC-2) to cold storage.
+
+**Multi-process / multi-instance deployments**
+The in-memory token cache is per-process. In a multi-worker or horizontally scaled
+deployment, impersonation sessions started on one instance will not be visible to others.
+Migrate the cache to Redis (with TTL matching the 1-hour session window) before deploying
+behind a load balancer.
+
+**Rate limiter does not survive restarts or scale horizontally**
+The in-memory `_impersonation_attempts` dict resets on process restart, and each
+worker/instance maintains its own counter. An attacker can reset the rate limit by
+waiting for a deploy, or distribute attempts across instances behind a load balancer.
+- **Fix:** Move to Redis-backed rate limiting (or use a Supabase RPC that checks
+  `impersonation_sessions` row count in the last N seconds) before multi-process deploy.

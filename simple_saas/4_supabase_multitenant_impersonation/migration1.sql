@@ -684,7 +684,7 @@ CREATE POLICY "project_roles_delete_owner"
 -- Audit rows are written by SECURITY DEFINER triggers only.
 -- The postgres/superuser role retains full access via ownership.
 -- ============================================================
-REVOKE UPDATE, DELETE ON public.audit_log FROM authenticated;
-REVOKE UPDATE, DELETE ON public.audit_log FROM anon;
+REVOKE UPDATE, INSERT, DELETE ON public.audit_log FROM authenticated;
+REVOKE UPDATE, INSERT, DELETE ON public.audit_log FROM anon;
 -- Prevent accidental DELETE in application code using the service-role client.
 REVOKE UPDATE, DELETE ON public.audit_log FROM service_role;
