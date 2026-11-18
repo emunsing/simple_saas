@@ -14,7 +14,7 @@ Multi-tenant ReBAC MVP: Supabase + FastAPI + Panel.
     /auth/impersonate/{user_id} — admin starts impersonating a user
     /auth/stop-impersonation    — return to admin's own session
 
-Run: uvicorn 3_supabase_multitenant_admin:app --reload --port 8000
+Run: uvicorn 4_supabase_multitenant_impersonation:app --reload --port 8000
 Set SUPABASE_APP_URL, SUPABASE_API_KEY, SUPABASE_SERVICE_ROLE_KEY in .env.
 Optional: AUTH_REDIRECT_URL, SESSION_SECRET_KEY (openssl rand -hex 32).
 Apply migration1.sql then migration2_impersonation.sql in Supabase before running.

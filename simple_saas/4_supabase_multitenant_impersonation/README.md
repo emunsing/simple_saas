@@ -7,12 +7,11 @@ audit headers.
 ## Setup
 
 ```bash
-# Apply migrations in order in the Supabase SQL editor:
+# Apply migrations in the Supabase SQL editor:
 #   migration1.sql
-#   migration2_impersonation.sql
-#   migration3_hmac_audit.sql
+#   migration_sampledata.sql
 
-# After migration3, store the HMAC secret in Supabase Vault:
+# After migrations, store the HMAC secret in Supabase Vault:
 SELECT vault.create_secret('your-secret-here', 'impersonation_hmac_secret');
 # Generate the secret with: openssl rand -hex 32
 #

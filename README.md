@@ -15,13 +15,16 @@ each of whom has multiple users, and users may share projects.
 The core idea builds off of the [webscenarios]() repository, specifically 
 [10_uvicorn_panel_db_reader_with_users.py](https://github.com/emunsing/webscenarios/blob/main/webscenarios/10_uvicorn_panel_db_reader_with_users.py), 
 which demonstrates a simple relationship-based access control system with users and shared projects, but which doesn't 
-attempt to implement authentication or multi-tenant support.
+attempt to implement authentication or multi-tenant support.  **Note the gotcha about Websocket cookie size for Panel + 
+Uvicorn noted in the webscenarios readme, and change the target address to 127.0.0.1 or 0.0.0.0 if localhost isn't 
+working**.
 
 The demos go in the following order:
 - `0_supabase_simple_oauth.py`: Basic PKCE OAuth with Supabase client
 - `1_supabase_panel_simple_oauth.py`: Similar to the above, but using Panel instead of raw HTML to ensure that your Panel + Uvicorn setup is working.
 - `2_supabase_multitenant_users`: Given pre-populated entries in the database, demonstrate we can do multi-tenant user authentication.
 - `3_supabase_multitenant_admin`: Add admin roles and views for user administration.
+- '4_supabase_multitenant_impersonation': Add the ability for admins to impersonate users, with appropriate security.
 
 # Running Demos:
 
@@ -32,7 +35,6 @@ uvicorn <folder_name>.<script_name>:app --reload --port 8000
 ```
 
 The uvicorn+panel demos can be run like `python <scriptname>.py` or `uvicorn <scriptname>:app --reload --port 8000`
-- IMPORTANT: See the below note about websocket gotchas when running Panel with Uvicorn
 - These require a postgres server to be running, and if the default Postgres URL isn't used, the URL should be overriden with the environment variable `DATABASE_URL`.
 
 # Specific requirements
@@ -54,6 +56,10 @@ user is present in the tenant_email_allowlist and triggering the update of the `
 in the auth.users table.  This is best accomplished from the "Authentication" page.
 2. Run the migrations, and then in the Supabase.com dashboard, go to Authentication ->  Auth Hooks and click
 "Add Hook" - in the dropdown, select "Before User Created hook". Choose the "hook_check_allowlist" function.
+
+## 4_supabase_multitenant_impersonation
+
+
 
 # Auth lessons
 
@@ -115,8 +121,6 @@ To debug this:
 
 ## Supabase, auth, and RLS
 [Helpful blog post by dob about RLS in SqlAlchemy](https://dobken.nl/posts/rls-postgres/)
-
-## 12_supabase_full_demo
 
 Flow for this:
 - 
