@@ -28,6 +28,7 @@ pydantic = {extras = ["email"], version = "*"}
 python-dotenv = "*"
 httpx = "*"
 supabase = "*"
+itsdangerous = "^2.2.0"
 
 [build-system]
 requires = ["poetry-core"]
